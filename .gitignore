@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+Package.resolved
+*.log
+*.tmp
+/.vscode/
+/.idea/
