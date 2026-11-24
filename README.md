@@ -15,6 +15,26 @@
 - **环境光自动亮度**：主程序内置控制器，每 45 秒读取系统公开的 `CurrentLux`，通过包内 `DDCControl` 联动受支持外屏；只有能读到有效 `CurrentLux` 的设备才可用。
 - **服务器模型**：在菜单栏弹窗的「路由」「用量」页嵌入服务器 Magpie 原网页，也可从右键菜单进入。所有额度、路由和调用统计均来自服务器；不读取本机模型账号。现有网页登录密钥保存在系统钥匙串，WebKit 使用独立的内存会话，关闭弹窗或切离服务器页面后停止页面轮询；连接可在页面右上角更新。
 
+## 界面预览
+
+### 菜单栏主面板（全部页面）
+
+| 系统状态 | 运行管理 · 应用监视 |
+| :---: | :---: |
+| <img src="docs/screenshots/01-system-status.png" width="380" alt="系统状态" /> | <img src="docs/screenshots/02-running-apps.png" width="380" alt="运行管理 · 应用监视" /> |
+| **运行管理 · 端口守卫** | **电源流向与外设电量** |
+| <img src="docs/screenshots/03-listening-ports.png" width="380" alt="运行管理 · 端口守卫" /> | <img src="docs/screenshots/04-power-flow.png" width="380" alt="电源流向与外设电量" /> |
+| **清理中心 · 四维内存透视** | **清理中心 · 磁盘缓存清理** |
+| <img src="docs/screenshots/05-memory-insights.png" width="380" alt="清理中心 · 四维内存透视" /> | <img src="docs/screenshots/06-disk-cleanup.png" width="380" alt="清理中心 · 磁盘缓存清理" /> |
+| **屏幕控制台（DDC 与布局保护）** | **快捷工具箱（一屏三卡）** |
+| <img src="docs/screenshots/07-display-console.png" width="380" alt="屏幕控制台" /> | <img src="docs/screenshots/08-quick-toolbox.png" width="380" alt="快捷工具箱" /> |
+
+### 偏好设置窗口
+
+| 通用设置 | 菜单栏显示配置 | 关于 |
+| :---: | :---: | :---: |
+| <img src="docs/screenshots/09-settings-general.png" width="260" alt="通用设置" /> | <img src="docs/screenshots/10-settings-display.png" width="260" alt="菜单栏显示配置" /> | <img src="docs/screenshots/11-settings-about.png" width="260" alt="关于" /> |
+
 ## 环境要求
 
 - **运行成品**：Apple Silicon（arm64）Mac，macOS 14 或更高版本；无需另装 Swift、Xcode、Homebrew 或旧显示器控制台。当前不是 Intel / Universal app。
