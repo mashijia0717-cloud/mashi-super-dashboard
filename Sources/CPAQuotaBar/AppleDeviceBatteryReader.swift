@@ -44,9 +44,32 @@ final class AppleDeviceBatteryReader: @unchecked Sendable {
         lock.unlock()
     }
 
+    func forceRefresh(completion: (@Sendable ([NearbyAppleDeviceBattery]) -> Void)? = nil) {
+        lock.lock()
+        guard !isScanning else {
+            let current = cachedDevices
+            lock.unlock()
+            completion?(current)
+            return
+        }
+        isScanning = true
+        nextScanDate = Date().addingTimeInterval(Self.scanInterval)
+        lock.unlock()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let scanned = self.scanDevices()
+            self.lock.lock()
+            self.cachedDevices = scanned
+            self.isScanning = false
+            self.lock.unlock()
+            completion?(scanned)
+        }
+    }
+
     private func scanDevices() -> [NearbyAppleDeviceBattery] {
         guard let toolsDirectory = Self.toolsDirectory() else {
-            return unavailableDevices(nearbyNames: nearbyDeviceNames())
+            return unavailableDevices(nearbyNames: nearbyNamesIfStale())
         }
 
         let deviceIDTool = toolsDirectory.appendingPathComponent("idevice_id").path
@@ -143,14 +166,18 @@ final class AppleDeviceBatteryReader: @unchecked Sendable {
     }
 
     private func nearbyNamesIfStale() -> [NearbyAppleDeviceKind: String] {
+        lock.lock()
         if Date().timeIntervalSince(nearbyNamesSampleDate) < 3600 {
-            return cachedNearbyNames
+            let cached = cachedNearbyNames
+            lock.unlock()
+            return cached
         }
+        lock.unlock()
         let names = nearbyDeviceNames()
-        if !names.isEmpty {
-            cachedNearbyNames = names
-            nearbyNamesSampleDate = Date()
-        }
+        lock.lock()
+        cachedNearbyNames = names
+        nearbyNamesSampleDate = Date()
+        lock.unlock()
         return names
     }
 
@@ -216,27 +243,49 @@ final class AppleDeviceBatteryReader: @unchecked Sendable {
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
+
+        final class DataBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var storage = Data()
+            var data: Data {
+                get { lock.withLock { storage } }
+                set { lock.withLock { storage = newValue } }
+            }
+        }
+        let box = DataBox()
+        let readGroup = DispatchGroup()
+        let readHandle = output.fileHandleForReading
+        readGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            box.data = readHandle.readDataToEndOfFile()
+            readGroup.leave()
+        }
 
         let semaphore = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in semaphore.signal() }
         do {
             try process.run()
         } catch {
+            try? output.fileHandleForWriting.close()
             return nil
         }
+        try? output.fileHandleForWriting.close()
 
         if semaphore.wait(timeout: .now() + timeout) == .timedOut {
             process.terminate()
-            if semaphore.wait(timeout: .now() + 0.5) == .timedOut {
+            if semaphore.wait(timeout: .now() + 0.5) == .timedOut, process.isRunning {
                 kill(process.processIdentifier, SIGKILL)
+                _ = semaphore.wait(timeout: .now() + 0.3)
             }
+            _ = readGroup.wait(timeout: .now() + 0.5)
             return nil
         }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
+        _ = readGroup.wait(timeout: .now() + 1.0)
         guard process.terminationStatus == 0 else { return nil }
-        return String(data: data, encoding: .utf8)
+        return String(data: box.data, encoding: .utf8)
     }
 
     static func keyValues(_ output: String) -> [String: String] {

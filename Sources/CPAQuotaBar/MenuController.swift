@@ -98,13 +98,30 @@ final class BlueThemeBackdropView: NSVisualEffectView {
 enum MenuGlassHost {
     static func wrap(_ content: NSView, cornerRadius: CGFloat = Tokens.panelRadius) -> NSView {
         if #available(macOS 26.0, *) {
+            let host = NSView(frame: NSRect(origin: .zero, size: Tokens.popoverSize))
+            host.wantsLayer = true
+            host.layer?.cornerRadius = cornerRadius
+            host.layer?.cornerCurve = .continuous
+            host.layer?.masksToBounds = true
+
             let glass = NSGlassEffectView(frame: NSRect(origin: .zero, size: Tokens.popoverSize))
             glass.cornerRadius = cornerRadius
             glass.style = .regular
-            glass.contentView = content
-            content.frame = glass.bounds
-            content.autoresizingMask = [.width, .height]
-            return glass
+            glass.translatesAutoresizingMaskIntoConstraints = false
+            content.translatesAutoresizingMaskIntoConstraints = false
+            host.addSubview(glass)
+            host.addSubview(content)
+            NSLayoutConstraint.activate([
+                glass.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+                glass.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+                glass.topAnchor.constraint(equalTo: host.topAnchor),
+                glass.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+                content.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+                content.topAnchor.constraint(equalTo: host.topAnchor),
+                content.bottomAnchor.constraint(equalTo: host.bottomAnchor)
+            ])
+            return host
         }
 
         let host = NSView(frame: NSRect(origin: .zero, size: Tokens.popoverSize))
@@ -150,6 +167,8 @@ class LiquidGlassCardView: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         applyGlassAccessibility()
@@ -173,7 +192,7 @@ class LiquidGlassCardView: NSView {
         if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
         let area = NSTrackingArea(
             rect: bounds,
-            options: [.activeInKeyWindow, .mouseEnteredAndExited],
+            options: [.activeAlways, .mouseEnteredAndExited],
             owner: self
         )
         addTrackingArea(area)
@@ -210,31 +229,37 @@ class LiquidGlassCardView: NSView {
 @MainActor
 final class MenuController: NSObject {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    private let panel: AnchoredStatusPanel
-    private let contentController = QuotaPopoverViewController()
+    private var loadedPanel: AnchoredStatusPanel?
+    private var loadedContentController: QuotaPopoverViewController?
+    private var panel: AnchoredStatusPanel {
+        if let loadedPanel { return loadedPanel }
+        let created = AnchoredStatusPanel(contentViewController: contentController)
+        loadedPanel = created
+        created.resizeContent(to: contentController.preferredContentSize)
+        return created
+    }
+    private var contentController: QuotaPopoverViewController {
+        if let loadedContentController { return loadedContentController }
+        let created = makeContentController()
+        loadedContentController = created
+        return created
+    }
     private let menuBarSystemMonitor = SystemStatusMonitor()
     private var settingsWindowController: SettingsWindowController?
     private var menuBarSystemSnapshot: SystemStatusSnapshot?
+    private var menuBarUsageMetrics: [SystemMetric] = []
     private var menuBarSamplingTask: Task<Void, Never>?
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var displaysSleeping = false
+    private var lastIconSignature: String?
     private let keepAwake = KeepAwakeController()
     private let screenClean = ScreenCleanModeController()
     private lazy var displayScenes = DisplaySceneController(keepAwake: keepAwake)
+    private let displaySafetyRecovery = DisplaySafetyRecoveryController()
 
     override init() {
-        self.panel = AnchoredStatusPanel(contentViewController: contentController)
         super.init()
-        contentController.onSettings = { [weak self] in self?.showSettings() }
-        contentController.onQuit = { NSApplication.shared.terminate(nil) }
-        contentController.onPreferredHeightChanged = { [weak self] height in
-            self?.panel.resizeContent(to: height)
-        }
         if let button = statusItem.button {
-            let image = NSImage(
-                systemSymbolName: "gauge.with.dots.needle.67percent",
-                accessibilityDescription: "系统仪表盘"
-            )
-            image?.isTemplate = true
-            button.image = image
             button.imagePosition = .imageOnly
             button.title = ""
             button.toolTip = AppBrand.displayName
@@ -252,44 +277,102 @@ final class MenuController: NSObject {
         }
     }
 
+    private func makeContentController() -> QuotaPopoverViewController {
+        let controller = QuotaPopoverViewController()
+        controller.onSettings = { [weak self] in self?.showSettings() }
+        controller.onQuit = { NSApplication.shared.terminate(nil) }
+        controller.onPreferredSizeChanged = { [weak self] size in
+            self?.loadedPanel?.resizeContent(to: size)
+        }
+        controller.keepAwakeController = keepAwake
+        controller.screenCleanController = screenClean
+        controller.onStatusBarNeedsUpdate = { [weak self] in self?.updateStatusItem() }
+        return controller
+    }
+
     func start() {
+        displaySafetyRecovery.start()
         keepAwake.start()
+        IntegratedHotCornerController.shared.sync()
+        AutoBrightnessController.shared.sync(deferFirstSample: CommandLine.arguments.contains("--rd-adopt-running"))
+        CoreAudioDeviceManager.shared.enforceBuiltinMicrophoneIfNeeded()
+        observeDisplaySleep()
         startMenuBarSampling()
         updateStatusItem()
     }
 
     func stop() {
+        displaySafetyRecovery.stop()
+        loadedPanel?.closePanel()
+        workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+        workspaceObservers.removeAll()
         screenClean.exit()
         displayScenes.stop()
         keepAwake.stop()
+        IntegratedHotCornerController.shared.stopPolling()
+        AutoBrightnessController.shared.stop()
         menuBarSamplingTask?.cancel()
         menuBarSamplingTask = nil
     }
 
     private func startMenuBarSampling() {
-        // 菜单栏没有选择任何系统指标时，不启动昂贵的 IOKit/SMC 采样循环。
-        guard MenuBarNumberOption.savedSelection().contains(where: {
-            $0 == .battery || $0 == .power || $0 == .mouseBattery
-        }) else { return }
-        guard menuBarSamplingTask == nil else { return }
+        guard menuBarSamplingTask == nil, !displaysSleeping else { return }
         menuBarSamplingTask = Task { [weak self, monitor = menuBarSystemMonitor] in
+            var nextPowerSample = Date.distantPast
+            var nextAlertCheck = Date.distantPast
             while !Task.isCancelled {
-                // 状态页/电源页有自己的实时采样；页面打开时暂停菜单栏采样，避免重复读取。
-                if self?.panel.isVisible == true {
-                    try? await Task.sleep(for: .seconds(2))
-                    continue
-                }
-                // 菜单栏只显示电量/功率/鼠标电量，走轻量采样：
-                // 不做 CPU/GPU/磁盘/网络与附近设备扫描。电量分钟级才变化，
-                // 功率 5 秒刷新也足够跟手，这里是全天驻留循环，省下的都是持续功耗。
-                let snapshot = await Task.detached(priority: .utility) {
-                    monitor.sampleMenuBar()
+                let now = Date()
+                let intervalSeconds = max(1, MenuBarRefreshInterval.load().rawValue)
+                let lineOptions = MenuBarLineOption.savedSelection()
+                let numberOptions = MenuBarNumberOption.savedSelection()
+                let wantsBackgroundAlerts = DashboardNotificationManager.shared.isEnabled && now >= nextAlertCheck
+                let includePower = wantsBackgroundAlerts || ((lineOptions.contains(where: \.requiresPowerSample)
+                    || numberOptions.contains(where: { $0 == .battery || $0 == .power || $0 == .mouseBattery })) && now >= nextPowerSample)
+                let (usage, snapshot) = await Task.detached(priority: .utility) {
+                    (monitor.sampleMenuBarUsage(lines: lineOptions, numbers: numberOptions), includePower ? monitor.sampleMenuBar() : nil)
                 }.value
                 guard !Task.isCancelled, let self else { return }
-                self.menuBarSystemSnapshot = snapshot
+                self.menuBarUsageMetrics = usage
+                if let snapshot {
+                    self.menuBarSystemSnapshot = snapshot
+                    nextPowerSample = now.addingTimeInterval(5)
+                    if wantsBackgroundAlerts {
+                        nextAlertCheck = now.addingTimeInterval(60)
+                        DashboardNotificationManager.shared.evaluatePower(snapshot.powerFlow)
+                    }
+                }
                 self.updateStatusItem()
-                try? await Task.sleep(for: .seconds(5))
+                try? await Task.sleep(for: .seconds(intervalSeconds))
             }
+        }
+    }
+
+    private func observeDisplaySleep() {
+        guard workspaceObservers.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.screensDidSleepNotification, NSWorkspace.willSleepNotification] {
+            workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.displaysSleeping = true
+                    self.loadedPanel?.closePanel()
+                    self.menuBarSamplingTask?.cancel()
+                    self.menuBarSamplingTask = nil
+                    IntegratedHotCornerController.shared.stopPolling()
+                    AutoBrightnessController.shared.setSleeping(true)
+                }
+            })
+        }
+        for name in [NSWorkspace.screensDidWakeNotification, DisplaySafetyPolicy.physicalScreensDidWakeNotification, NSWorkspace.didWakeNotification] {
+            workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.displaysSleeping = false
+                    self.startMenuBarSampling()
+                    IntegratedHotCornerController.shared.sync()
+                    AutoBrightnessController.shared.setSleeping(false)
+                }
+            })
         }
     }
 
@@ -301,8 +384,9 @@ final class MenuController: NSObject {
 
     func showPopover() {
         guard let button = statusItem.button, !panel.isVisible else { return }
-        panel.show(relativeTo: button)
-        contentController.setPopoverVisible(true)
+        if panel.show(relativeTo: button) {
+            contentController.setPopoverVisible(true)
+        }
     }
 
     func writeDebugFrames() {
@@ -321,6 +405,38 @@ final class MenuController: NSObject {
         contentController.showStorageCleanupPage()
     }
 
+    func showDisplayConsolePage() {
+        contentController.showDisplayConsolePage()
+    }
+
+    func showToolboxPage() {
+        contentController.showToolboxPage()
+    }
+
+    func showRunningAppsPage(ports: Bool = false) {
+        contentController.showRunningAppsPage(ports: ports)
+    }
+
+    func showDiskCleanupPage() {
+        contentController.showDiskCleanupPage()
+    }
+
+    func showMagpiePage(_ page: MagpieServerPage) {
+        contentController.showMagpiePage(page)
+        showPopover()
+    }
+
+    @objc private func openMagpieRouting() { showMagpiePage(.routing) }
+    @objc private func openMagpieUsage() { showMagpiePage(.usage) }
+    @objc private func openDisplayConsoleFromMenu() {
+        contentController.showDisplayConsolePage()
+        showPopover()
+    }
+    @objc private func openMemoryCleanupFromMenu() {
+        contentController.showStorageCleanupPage()
+        showPopover()
+    }
+
     @objc private func handleStatusItemClick(_ sender: NSStatusBarButton) {
         let event = NSApp.currentEvent
         let isRightClick = event?.type == .rightMouseUp
@@ -337,18 +453,72 @@ final class MenuController: NSObject {
         guard let button = statusItem.button else { return }
         if panel.isVisible {
             panel.closePanel()
-        } else {
-            panel.show(relativeTo: button)
+        } else if panel.show(relativeTo: button) {
             contentController.setPopoverVisible(true)
         }
     }
 
     private func updateStatusItem() {
         guard let button = statusItem.button else { return }
+        let lineOptions = MenuBarLineOption.savedSelection()
+        let usage: [Double?] = lineOptions.map { option in
+            switch option {
+            case .battery: return menuBarSystemSnapshot?.powerFlow.batteryLevel
+            case .power: return menuBarSystemSnapshot?.powerFlow.systemWatts.map { $0 / 100 }
+            case .mouseBattery: return menuBarSystemSnapshot?.metrics.first(where: { $0.kind == .mouseBattery })?.value
+            case .cpuTemp:
+                return menuBarUsageMetrics.first(where: { $0.kind == .thermal })?.value
+            case .cpu, .gpu, .memory, .disk:
+                return menuBarUsageMetrics.first(where: { $0.kind.rawValue == option.rawValue })?.value
+            }
+        }
+        let iconSignature = zip(lineOptions, usage).map { option, value in
+            guard let value, value.isFinite else { return option.rawValue + ":unknown" }
+            let fraction = min(max(value, 0), 1)
+            let band = option.isBattery ? (fraction <= 0.2 ? 0 : (fraction <= 0.5 ? 1 : 2)) : (fraction >= 0.8 ? 0 : (fraction >= 0.5 ? 1 : 2))
+            return "\(option.rawValue):\(Int((fraction * 40).rounded())):\(band)"
+        }.joined(separator: "|")
+        if lastIconSignature != iconSignature {
+        lastIconSignature = iconSignature
+        let image = NSImage(size: NSSize(width: 20, height: 18), flipped: false) { bounds in
+            for (index, value) in usage.enumerated() {
+                let track = NSRect(x: 0, y: 13 - CGFloat(index) * 6, width: bounds.width, height: 3)
+                NSColor.systemGray.withAlphaComponent(0.4).setFill()
+                NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
+                guard let value, value.isFinite else { continue }
+                let fraction = min(max(value, 0), 1)
+                guard fraction > 0 else { continue }
+                let color: NSColor
+                if lineOptions[index].isBattery {
+                    color = fraction <= 0.2 ? .systemRed : (fraction <= 0.5 ? .systemYellow : .systemGreen)
+                } else {
+                    color = fraction >= 0.8 ? .systemRed : (fraction >= 0.5 ? .systemYellow : .systemGreen)
+                }
+                color.setFill()
+                let fill = NSRect(x: track.minX, y: track.minY, width: max(1, track.width * fraction), height: track.height)
+                NSBezierPath(roundedRect: fill, xRadius: 1.5, yRadius: 1.5).fill()
+            }
+            return true
+        }
+        image.isTemplate = false
+        button.image = image
+        }
         let selected = MenuBarNumberOption.savedSelection()
         var values: [String] = []
         for option in MenuBarNumberOption.allCases where selected.contains(option) {
             switch option {
+            case .cpu:
+                let raw = menuBarUsageMetrics.first(where: { $0.kind == .cpu })?.rawString
+                values.append(raw ?? "--")
+            case .memory:
+                let raw = menuBarUsageMetrics.first(where: { $0.kind == .memory })?.rawString
+                values.append(raw ?? "--")
+            case .cpuTemp:
+                let raw = menuBarUsageMetrics.first(where: { $0.kind == .thermal })?.rawString
+                values.append(raw ?? "--")
+            case .network:
+                let raw = menuBarUsageMetrics.first(where: { $0.kind == .network })?.rawString
+                values.append(raw ?? "--")
             case .battery:
                 values.append(percent(menuBarSystemSnapshot?.powerFlow.batteryLevel))
             case .power:
@@ -360,27 +530,30 @@ final class MenuController: NSObject {
         }
 
         if values.isEmpty {
-            statusItem.length = NSStatusItem.squareLength
-            button.title = ""
-            button.imagePosition = .imageOnly
+            if statusItem.length != NSStatusItem.squareLength { statusItem.length = NSStatusItem.squareLength }
+            if !button.title.isEmpty { button.title = "" }
+            if button.imagePosition != .imageOnly { button.imagePosition = .imageOnly }
         } else {
-            statusItem.length = NSStatusItem.variableLength
-            button.title = " " + values.joined(separator: "  ")
-            button.imagePosition = .imageLeading
+            if statusItem.length != NSStatusItem.variableLength { statusItem.length = NSStatusItem.variableLength }
+            let title = " " + values.joined(separator: "  ")
+            if button.title != title { button.title = title }
+            if button.imagePosition != .imageLeading { button.imagePosition = .imageLeading }
         }
 
         var tooltip = AppBrand.displayName
+        tooltip += "\n" + zip(lineOptions, usage).map { option, value in
+            option.title + " " + (option == .power ? watts(menuBarSystemSnapshot?.powerFlow.systemWatts) : percent(value))
+        }.joined(separator: " · ")
         if keepAwake.isEnabled {
             tooltip += " · 屏幕常亮"
         }
         if screenClean.isActive {
             tooltip += " · 擦屏模式"
         }
-        let offDisplays = ConnectedDisplays.current().filter { displayScenes.isDisplayOff($0.id) }
-        if !offDisplays.isEmpty {
-            tooltip += " · 已关 \(offDisplays.map { "显示器 \($0.index)" }.joined(separator: "、"))"
+        if button.toolTip != tooltip {
+            button.toolTip = tooltip
+            button.setAccessibilityLabel(tooltip)
         }
-        button.toolTip = tooltip
     }
 
     private func showStatusMenu(from button: NSStatusBarButton) {
@@ -389,6 +562,16 @@ final class MenuController: NSObject {
         }
         let menu = NSMenu()
         menu.autoenablesItems = false
+
+        addStatusMenuItem(menu, title: "显示器控制台", symbol: "display.2",
+            action: #selector(openDisplayConsoleFromMenu))
+        addStatusMenuItem(menu, title: "内存透视与清理", symbol: "memorychip",
+            action: #selector(openMemoryCleanupFromMenu))
+        addStatusMenuItem(menu, title: "模型路由 · 服务器", symbol: "arrow.triangle.branch",
+            action: #selector(openMagpieRouting))
+        addStatusMenuItem(menu, title: "用量概览 · 服务器", symbol: "chart.bar.xaxis",
+            action: #selector(openMagpieUsage))
+        menu.addItem(.separator())
 
         addStatusMenuItem(
             menu,
@@ -425,25 +608,6 @@ final class MenuController: NSObject {
             symbol: "lock.fill",
             action: #selector(lockScreenFromStatusMenu)
         )
-
-        let displays = ConnectedDisplays.current()
-        if !displays.isEmpty {
-            menu.addItem(.separator())
-            for display in displays {
-                let item = addStatusMenuItem(
-                    menu,
-                    title: DisplaySceneFormatting.menuTitle(
-                        index: display.index,
-                        name: display.name,
-                        isOff: displayScenes.isDisplayOff(display.id)
-                    ),
-                    symbol: display.isBuiltin ? "laptopcomputer" : "display",
-                    action: #selector(toggleDisplayFromStatusMenu(_:)),
-                    state: displayScenes.isDisplayOff(display.id) ? .on : .off
-                )
-                item.representedObject = NSNumber(value: display.id)
-            }
-        }
 
         menu.addItem(.separator())
 
@@ -520,23 +684,11 @@ final class MenuController: NSObject {
         displayScenes.lockScreen()
     }
 
-    @objc private func toggleDisplayFromStatusMenu(_ sender: NSMenuItem) {
-        guard let number = sender.representedObject as? NSNumber else { return }
-        let id = CGDirectDisplayID(truncating: number)
-        guard let display = ConnectedDisplays.current().first(where: { $0.id == id }) else { return }
-        if panel.isVisible {
-            panel.closePanel()
-        }
-        displayScenes.toggleDisplay(display)
-        updateStatusItem()
-    }
-
     @objc private func openSettingsFromStatusMenu() {
         showSettings()
     }
 
     @objc private func quitFromStatusMenu() {
-        stop()
         NSApplication.shared.terminate(nil)
     }
 
@@ -554,12 +706,13 @@ final class MenuController: NSObject {
 
     private func showSettings() {
         if settingsWindowController == nil {
-            let controller = SettingsWindowController()
+            let controller = SettingsWindowController(contentController: AppSettingsViewController())
             controller.onSettingsSaved = { [weak self] in
                 self?.keepAwake.start()
+                IntegratedHotCornerController.shared.sync()
                 self?.restartMenuBarSampling()
                 self?.updateStatusItem()
-                self?.contentController.refreshLayout()
+                self?.loadedContentController?.refreshLayout()
             }
             settingsWindowController = controller
         }
@@ -577,7 +730,14 @@ final class FlippedDocumentView: NSView {
 final class QuotaPopoverViewController: NSViewController {
     var onSettings: (() -> Void)?
     var onQuit: (() -> Void)?
-    var onPreferredHeightChanged: ((CGFloat) -> Void)?
+    var onPreferredSizeChanged: ((NSSize) -> Void)?
+    var onStatusBarNeedsUpdate: (() -> Void)?
+    weak var keepAwakeController: KeepAwakeController?
+    weak var screenCleanController: ScreenCleanModeController?
+
+    private let magpieDashboard = MagpieDashboardController()
+    private var viewWidthConstraint: NSLayoutConstraint?
+    private var isServerPage: Bool { selectedPage == 5 || selectedPage == 6 }
 
     private let rootStack = NSStackView()
     private let scrollView = NSScrollView()
@@ -588,14 +748,31 @@ final class QuotaPopoverViewController: NSViewController {
     private let updatedLabel = NSTextField(labelWithString: "尚未刷新")
     private let pageControl = NSSegmentedControl(labels: ["状态", "运行", "电源", "清理"], trackingMode: .selectOne, target: nil, action: nil)
     private var pageControlWidthConstraint: NSLayoutConstraint?
-    private var selectedPage = 1
-    private var segmentPages = [1, 2, 3, 4]
+    private(set) var selectedPage = 1
+    private var segmentPages = [1, 2, 3, 4, 8, 7]
     private let systemMonitor = SystemStatusMonitor()
     private let runningAppsMonitor = RunningAppsMonitor()
     private var systemSamplingTask: Task<Void, Never>?
     private var appsSamplingTask: Task<Void, Never>?
+    private var memoryCleanupSamplingTask: Task<Void, Never>?
+    private var memorySampleTask: Task<Void, Never>?
+    private var portScanTask: Task<Void, Never>?
     private var runningApps: [RunningApp] = []
+    private var listeningPorts: [ListeningPortItem] = []
+    private var portTargets: [String: ListeningPortProcessController.Target] = [:]
+    private var portTerminationTask: Task<Void, Never>?
+    private var runningSubmode: RunningPageSubmode = .apps
+    private var runningSearchQuery: String = ""
+    private var runningToolbar: RunningAppsToolbarView?
+    private var runningRows: [RunningAppIdentity: RunningAppRowView] = [:]
+    private var portRows: [String: ListeningPortRowView] = [:]
+
+    private var cleanupMode: CleanupPageMode = .memory
+    private var memoryCleanupDashboard: MemoryCleanupDashboardView?
     private var cleanupDashboard: StorageCleanupDashboardView?
+    var makeDisplayConsole: () -> DisplayConsoleDashboardView = { DisplayConsoleDashboardView() }
+    private var displayConsoleDashboard: DisplayConsoleDashboardView?
+    private var toolboxDashboard: QuickToolboxDashboardView?
     private var cleanupScanTask: Task<Void, Never>?
     private var cleanupScanCancellation: CleanupScanCancellation?
     private var runningAppsSortMode = RunningAppsSortMode(
@@ -625,10 +802,9 @@ final class QuotaPopoverViewController: NSViewController {
         view = MenuGlassHost.wrap(content)
         let heightConstraint = view.heightAnchor.constraint(equalToConstant: Tokens.popoverSize.height)
         viewHeightConstraint = heightConstraint
-        NSLayoutConstraint.activate([
-            view.widthAnchor.constraint(equalToConstant: Tokens.popoverSize.width),
-            heightConstraint
-        ])
+        let widthConstraint = view.widthAnchor.constraint(equalToConstant: Tokens.popoverSize.width)
+        viewWidthConstraint = widthConstraint
+        NSLayoutConstraint.activate([widthConstraint, heightConstraint])
 
         rootStack.addArrangedSubview(makeHeader())
 
@@ -661,6 +837,9 @@ final class QuotaPopoverViewController: NSViewController {
         scrollView.scrollerStyle = .overlay
         scrollView.setContentHuggingPriority(.defaultLow, for: .vertical)
         rootStack.addArrangedSubview(scrollView)
+        addChild(magpieDashboard)
+        magpieDashboard.view.isHidden = true
+        rootStack.addArrangedSubview(magpieDashboard.view)
 
         preferredContentSize = Tokens.popoverSize
 
@@ -694,16 +873,28 @@ final class QuotaPopoverViewController: NSViewController {
     }
 
     private func renderSelectedPage() {
+        displayConsoleDashboard?.isPresented = isPopoverVisible && selectedPage == 8
         stopSystemSampling()
         stopAppsSampling()
+        stopMemoryCleanupSampling()
+        portScanTask?.cancel()
+        portScanTask = nil
         stopCleanupScanning()
         systemCards.removeAll()
         powerDashboard = nil
+        memoryCleanupDashboard = nil
         cleanupDashboard = nil
+        toolboxDashboard = nil
+        runningToolbar = nil
+        runningRows.removeAll()
+        portRows.removeAll()
         accountStack.arrangedSubviews.forEach {
             accountStack.removeArrangedSubview($0)
             $0.removeFromSuperview()
         }
+        scrollView.isHidden = isServerPage
+        magpieDashboard.view.isHidden = !isServerPage
+        if !isServerPage { magpieDashboard.suspend() }
         switch selectedPage {
         case 1:
             renderSystemStatusPage()
@@ -716,6 +907,12 @@ final class QuotaPopoverViewController: NSViewController {
             updateSystemSamplingState()
         case 4:
             renderStorageCleanupPage()
+        case 7:
+            renderToolboxPage()
+        case 8:
+            renderDisplayConsolePage()
+        case 5, 6:
+            if isPopoverVisible { magpieDashboard.show(page: selectedPage == 5 ? .routing : .usage) }
         default:
             renderSystemStatusPage()
             updateSystemSamplingState()
@@ -728,6 +925,13 @@ final class QuotaPopoverViewController: NSViewController {
     }
 
     private func updatePreferredHeight() {
+        if isServerPage {
+            let screen = view.window?.screen ?? NSScreen.main
+            let available = screen?.visibleFrame.size ?? NSSize(width: 1280, height: 840)
+            applyPreferredSize(NSSize(width: min(1240, available.width - 16), height: min(850, available.height - 16)))
+            return
+        }
+        applyPreferredSize(NSSize(width: Tokens.popoverSize.width, height: viewHeightConstraint?.constant ?? Tokens.popoverSize.height))
         view.layoutSubtreeIfNeeded()
         scrollView.layoutSubtreeIfNeeded()
         accountStack.layoutSubtreeIfNeeded()
@@ -739,14 +943,17 @@ final class QuotaPopoverViewController: NSViewController {
                 document.setFrameSize(NSSize(width: Tokens.popoverSize.width, height: documentHeight))
             }
         }
-        let desired = min(
-            Tokens.popoverSize.height,
-            max(260, Tokens.headerHeight + contentHeight + 2)
-        )
-        guard abs((viewHeightConstraint?.constant ?? desired) - desired) > 1 else { return }
-        viewHeightConstraint?.constant = desired
-        preferredContentSize = NSSize(width: Tokens.popoverSize.width, height: desired)
-        onPreferredHeightChanged?(desired)
+        let fittedHeight = Tokens.headerHeight + contentHeight + 2
+        let desired = min(Tokens.popoverSize.height, selectedPage == 8 ? fittedHeight : max(260, fittedHeight))
+        applyPreferredSize(NSSize(width: Tokens.popoverSize.width, height: desired))
+    }
+
+    private func applyPreferredSize(_ size: NSSize) {
+        viewWidthConstraint?.constant = size.width
+        viewHeightConstraint?.constant = size.height
+        preferredContentSize = size
+        pageControlWidthConstraint?.constant = isServerPage ? min(520, size.width - 110) : 292
+        onPreferredSizeChanged?(size)
     }
 
     private func measuredAccountContentHeight() -> CGFloat {
@@ -771,62 +978,331 @@ final class QuotaPopoverViewController: NSViewController {
             SystemMetric(kind: .memory, title: "内存", detail: "正在采样…", value: nil, accessibilityHelp: "物理内存当前使用比例"),
             SystemMetric(kind: .disk, title: "磁盘", detail: "正在采样…", value: nil, accessibilityHelp: "启动磁盘已使用容量比例"),
             SystemMetric(kind: .power, title: "功率", detail: "正在读取…", value: nil, accessibilityHelp: "Apple 电源遥测中的当前系统实际功耗"),
+            SystemMetric(kind: .thermal, title: "散热", detail: "正在读取…", value: nil, accessibilityHelp: "处理器温度与风扇转速"),
             SystemMetric(kind: .network, title: "网络", detail: "正在采样…", value: nil, accessibilityHelp: "当前网络上传与下载速率"),
             SystemMetric(kind: .battery, title: "电池", detail: "正在读取…", value: nil, accessibilityHelp: "电池电量、充电状态与健康信息"),
             SystemMetric(kind: .mouseBattery, title: "鼠标", detail: "正在读取…", value: nil, accessibilityHelp: "已连接鼠标的剩余电量")
         ]
         for metric in placeholders {
             let card = SystemMetricCard(metric: metric)
+            card.onTap = { [weak self] kind in
+                self?.handleMetricCardClick(kind)
+            }
             systemCards[metric.kind] = card
             accountStack.addArrangedSubview(card)
         }
     }
 
+    func handleMetricCardClick(_ kind: SystemMetric.Kind) {
+        switch kind {
+        case .cpu, .gpu:
+            jumpToPage(2)
+        case .memory:
+            cleanupMode = .memory
+            jumpToPage(4)
+        case .disk:
+            cleanupMode = .disk
+            jumpToPage(4)
+        case .power, .battery, .thermal, .mouseBattery:
+            jumpToPage(3)
+        case .network:
+            jumpToPage(7)
+        }
+    }
+
+    private func jumpToPage(_ page: Int) {
+        loadViewIfNeeded()
+        if !segmentPages.contains(page) {
+            UserDefaults.standard.set(true, forKey: "dashboardPageVisible\(page)")
+            configureVisiblePages()
+        }
+        selectedPage = page
+        pageControl.selectedSegment = segmentPages.firstIndex(of: page) ?? 0
+        renderSelectedPage()
+    }
+
     func setPopoverVisible(_ visible: Bool) {
         isPopoverVisible = visible
+        displayConsoleDashboard?.isPresented = visible && selectedPage == 8
+        powerDashboard?.setAnimationsActive(visible && selectedPage == 3)
+        if visible && isServerPage { magpieDashboard.show(page: selectedPage == 5 ? .routing : .usage) }
+        else { magpieDashboard.suspend() }
         updateSystemSamplingState()
         updateAppsSamplingState()
+        updateMemoryCleanupSamplingState()
+        if visible {
+            toolboxDashboard?.refreshState()
+            if selectedPage == 8 { displayConsoleDashboard?.refreshAll() }
+        }
     }
 
     func showSystemStatusPage() {
-        loadViewIfNeeded()
-        selectedPage = 1
-        pageControl.selectedSegment = segmentPages.firstIndex(of: 1) ?? 0
-        renderSelectedPage()
+        jumpToPage(1)
     }
 
     func showPowerFlowPage() {
-        loadViewIfNeeded()
-        selectedPage = 3
-        pageControl.selectedSegment = segmentPages.firstIndex(of: 3) ?? 0
-        renderSelectedPage()
+        jumpToPage(3)
     }
 
     func showStorageCleanupPage() {
-        loadViewIfNeeded()
-        selectedPage = 4
-        pageControl.selectedSegment = segmentPages.firstIndex(of: 4) ?? 0
-        renderSelectedPage()
+        jumpToPage(4)
+    }
+
+    func showDisplayConsolePage() {
+        jumpToPage(8)
+    }
+
+    func showToolboxPage() {
+        jumpToPage(7)
+    }
+
+    func showRunningAppsPage(ports: Bool = false) {
+        runningSubmode = ports ? .ports : .apps
+        jumpToPage(2)
+        if ports { triggerPortScan() }
+    }
+
+    func showDiskCleanupPage() {
+        cleanupMode = .disk
+        jumpToPage(4)
     }
 
     private func renderPowerFlowPage() {
         let dashboard = PowerFlowDashboardView()
         powerDashboard = dashboard
+        dashboard.setAnimationsActive(isPopoverVisible)
         dashboard.onHeightChanged = { [weak self] in
             self?.updatePreferredHeight()
+        }
+        dashboard.onRefreshNearbyDevices = { [weak self] in
+            guard let controller = self else { return }
+            SystemStatusMonitor.refreshNearbyDevices { [weak controller] _ in
+                let target = controller
+                Task { @MainActor in
+                    guard let target, target.selectedPage == 3 else { return }
+                    let monitor = target.systemMonitor
+                    let snap = await Task.detached(priority: .userInitiated) {
+                        monitor.sample(includeBatteryPackDetail: true)
+                    }.value
+                    guard target.selectedPage == 3 else { return }
+                    target.applySystemSnapshot(snap)
+                }
+            }
         }
         accountStack.addArrangedSubview(dashboard)
     }
 
-    private func renderStorageCleanupPage() {
-        let dashboard = StorageCleanupDashboardView()
-        cleanupDashboard = dashboard
-        dashboard.onScan = { [weak self] in self?.scanStorageCleanup() }
-        dashboard.onClean = { [weak self] items in
-            self?.confirmStorageCleanup(items: items)
+    func showMagpiePage(_ page: MagpieServerPage) {
+        loadViewIfNeeded()
+        selectedPage = page == .routing ? 5 : 6
+        if !segmentPages.contains(selectedPage) {
+            UserDefaults.standard.set(true, forKey: "dashboardPageVisible\(selectedPage)")
+            configureVisiblePages()
         }
-        dashboard.onHeightChanged = { [weak self] in self?.updatePreferredHeight() }
-        accountStack.addArrangedSubview(dashboard)
+        pageControl.selectedSegment = segmentPages.firstIndex(of: selectedPage) ?? 0
+        renderSelectedPage()
+        updatePreferredHeight()
+    }
+
+    private func renderStorageCleanupPage() {
+        let modeBar = NSSegmentedControl(
+            labels: CleanupPageMode.allCases.map(\.title),
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(cleanupModeChanged(_:))
+        )
+        modeBar.controlSize = .small
+        modeBar.segmentStyle = .rounded
+        modeBar.segmentDistribution = .fillEqually
+        modeBar.selectedSegment = CleanupPageMode.allCases.firstIndex(of: cleanupMode) ?? 0
+        modeBar.translatesAutoresizingMaskIntoConstraints = false
+        modeBar.widthAnchor.constraint(equalToConstant: Tokens.cardWidth).isActive = true
+        accountStack.addArrangedSubview(modeBar)
+
+        switch cleanupMode {
+        case .memory:
+            let memView = MemoryCleanupDashboardView()
+            memoryCleanupDashboard = memView
+            memView.onHeightChanged = { [weak self] in self?.updatePreferredHeight() }
+            memView.onRefreshRequested = { [weak self] in self?.sampleMemoryCleanupOnce() }
+            memView.onSmartClean = { [weak self] selectedIDs in
+                self?.performSmartMemoryClean(selectedIDs: selectedIDs)
+            }
+            memView.onTerminateSingleApp = { [weak self] app in
+                self?.gracefullyQuitFromMemoryView(app)
+            }
+            accountStack.addArrangedSubview(memView)
+            sampleMemoryCleanupOnce()
+            updateMemoryCleanupSamplingState()
+        case .disk:
+            let dashboard = StorageCleanupDashboardView()
+            cleanupDashboard = dashboard
+            dashboard.onScan = { [weak self] in self?.scanStorageCleanup() }
+            dashboard.onClean = { [weak self] items in
+                self?.confirmStorageCleanup(items: items)
+            }
+            dashboard.onHeightChanged = { [weak self] in self?.updatePreferredHeight() }
+            accountStack.addArrangedSubview(dashboard)
+            scanStorageCleanup()
+        }
+    }
+
+    @objc private func cleanupModeChanged(_ sender: NSSegmentedControl) {
+        let idx = min(max(0, sender.selectedSegment), CleanupPageMode.allCases.count - 1)
+        cleanupMode = CleanupPageMode.allCases[idx]
+        renderSelectedPage()
+    }
+
+    private func sampleMemoryCleanupOnce() {
+        guard memorySampleTask == nil, selectedPage == 4, cleanupMode == .memory, let memView = memoryCleanupDashboard else { return }
+        let candidates = runningAppsMonitor.candidates()
+        let monitor = systemMonitor
+        let appsMonitor = runningAppsMonitor
+        memorySampleTask = Task { [weak self, weak memView] in
+            defer { self?.memorySampleTask = nil }
+            let (mem, apps) = await Task.detached(priority: .userInitiated) {
+                (monitor.sampleDetailedMemory(), appsMonitor.sample(candidates))
+            }.value
+            guard let self, self.selectedPage == 4, self.cleanupMode == .memory,
+                  self.memoryCleanupDashboard === memView else { return }
+            self.runningApps = apps
+            memView?.update(memory: mem, apps: apps)
+        }
+    }
+
+    private func updateMemoryCleanupSamplingState() {
+        guard isPopoverVisible, selectedPage == 4, cleanupMode == .memory else {
+            stopMemoryCleanupSampling()
+            return
+        }
+        guard memoryCleanupSamplingTask == nil else { return }
+        memoryCleanupSamplingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, let self, self.isPopoverVisible, self.selectedPage == 4, self.cleanupMode == .memory else { return }
+                self.sampleMemoryCleanupOnce()
+            }
+        }
+    }
+
+    private func stopMemoryCleanupSampling() {
+        memoryCleanupSamplingTask?.cancel()
+        memoryCleanupSamplingTask = nil
+    }
+
+    private func performSmartMemoryClean(selectedIDs: [RunningAppIdentity]) {
+        guard let memView = memoryCleanupDashboard else { return }
+        memView.setCleaning(true)
+        let beforeMem = systemMonitor.sampleDetailedMemory()?.availableBytes
+        let requestedIDs = Array(Set(selectedIDs))
+        let acceptedIDs = requestedIDs.filter { runningAppsMonitor.terminateGracefully($0) == .terminated }
+        SafeMemoryOptimizer.releaseUserSpaceCaches()
+        Task { [weak self, weak memView] in
+            try? await Task.sleep(for: .milliseconds(1100))
+            guard let self else { return }
+            SafeMemoryOptimizer.releaseUserSpaceCaches()
+            let candidates = self.runningAppsMonitor.candidates()
+            let monitor = self.systemMonitor
+            let appsMonitor = self.runningAppsMonitor
+            let (afterSnap, freshApps, closedAppsCount) = await Task.detached(priority: .userInitiated) {
+                (monitor.sampleDetailedMemory(), appsMonitor.sample(candidates), acceptedIDs.filter { appsMonitor.isIdentityRunning($0) == false }.count)
+            }.value
+            memView?.setCleaning(false)
+            memView?.update(memory: afterSnap, apps: freshApps)
+            memView?.showComparisonResult(
+                beforeAvailable: beforeMem,
+                afterAvailable: afterSnap?.availableBytes,
+                closedCount: closedAppsCount,
+                requestedCount: requestedIDs.count
+            )
+        }
+    }
+
+    private func gracefullyQuitFromMemoryView(_ app: RunningApp) {
+        let beforeMem = systemMonitor.sampleDetailedMemory()?.availableBytes
+        let res = runningAppsMonitor.terminateGracefully(app.identity)
+        guard res == .terminated else {
+            showActionError("未能退出 \(app.localizedName)（可能有未保存文档等待确认）")
+            return
+        }
+        memoryCleanupDashboard?.setCleaning(true)
+        Task { [weak self, weak memView = memoryCleanupDashboard] in
+            try? await Task.sleep(for: .milliseconds(900))
+            guard let self, let memView else { return }
+            let candidates = self.runningAppsMonitor.candidates()
+            let monitor = self.systemMonitor
+            let appsMonitor = self.runningAppsMonitor
+            let (afterSnap, freshApps, didExit) = await Task.detached(priority: .userInitiated) {
+                (monitor.sampleDetailedMemory(), appsMonitor.sample(candidates), appsMonitor.isIdentityRunning(app.identity) == false)
+            }.value
+            memView.setCleaning(false)
+            memView.update(memory: afterSnap, apps: freshApps)
+            memView.showComparisonResult(
+                beforeAvailable: beforeMem,
+                afterAvailable: afterSnap?.availableBytes,
+                closedCount: didExit ? 1 : 0,
+                requestedCount: 1
+            )
+        }
+    }
+
+    private func renderDisplayConsolePage() {
+        let console = displayConsoleDashboard ?? makeDisplayConsole()
+        displayConsoleDashboard = console
+        console.isPresented = isPopoverVisible
+        console.onHeightChanged = { [weak self] in
+            guard let self, self.selectedPage == 8 else { return }
+            self.updatePreferredHeight()
+        }
+        accountStack.addArrangedSubview(console)
+        console.refreshAll()
+    }
+
+    private func renderToolboxPage() {
+        let toolbox = QuickToolboxDashboardView()
+        toolboxDashboard = toolbox
+        toolbox.onHeightChanged = { [weak self] in self?.updatePreferredHeight() }
+        toolbox.keepAwakeSummaryProvider = { [weak self] in
+            guard let ka = self?.keepAwakeController else { return (0, "跟随系统默认休眠设置") }
+            if let mins = ka.activeTimedRemainingMinutes {
+                let idx = mins <= 30 ? 1 : (mins <= 60 ? 2 : 3)
+                return (idx, ka.statusSummary ?? "定时常亮中")
+            }
+            if ka.isEnabled {
+                return (4, "始终保持屏幕常亮（已阻止自动休眠）")
+            }
+            return (0, "跟随系统默认休眠设置")
+        }
+        toolbox.onSelectKeepAwakeMode = { [weak self] mode in
+            guard let ka = self?.keepAwakeController else { return }
+            if let minutes = mode {
+                if minutes == 0 {
+                    ka.isEnabled = true
+                } else {
+                    ka.startTimed(minutes: minutes)
+                }
+            } else {
+                ka.isEnabled = false
+                ka.cancelTimedAwake()
+            }
+            self?.onStatusBarNeedsUpdate?()
+        }
+        toolbox.onTogglePresentationMode = { [weak self] in
+            guard let ka = self?.keepAwakeController else { return false }
+            let active = PresentationModeController.shared.toggle(keepAwake: ka)
+            self?.onStatusBarNeedsUpdate?()
+            return active
+        }
+        toolbox.onEnterScreenClean = { [weak self] in
+            guard let self, let clean = self.screenCleanController else { return }
+            (self.view.window as? AnchoredStatusPanel)?.closePanel()
+            self.setPopoverVisible(false)
+            self.keepAwakeController?.beginTemporaryHold()
+            clean.enter()
+            self.onStatusBarNeedsUpdate?()
+        }
+        accountStack.addArrangedSubview(toolbox)
+        toolbox.refreshState()
     }
 
     private func stopCleanupScanning() {
@@ -963,22 +1439,91 @@ final class QuotaPopoverViewController: NSViewController {
     }
 
     private func renderRunningAppsPage() {
-        if runningApps.isEmpty {
-            accountStack.addArrangedSubview(messageView(icon: "arrow.triangle.2.circlepath", text: "正在读取运行中应用…", color: .secondaryLabelColor))
-            return
-        }
-        let toolbar = RunningAppsToolbarView(mode: runningAppsSortMode)
+        let toolbar = runningToolbar ?? RunningAppsToolbarView(
+            mode: runningAppsSortMode,
+            submode: runningSubmode,
+            query: runningSearchQuery
+        )
+        runningToolbar = toolbar
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         toolbar.widthAnchor.constraint(equalToConstant: Tokens.cardWidth).isActive = true
-        toolbar.heightAnchor.constraint(equalToConstant: 32).isActive = true
         toolbar.onChange = { [weak self] mode in
             guard let self else { return }
             self.runningAppsSortMode = mode
             UserDefaults.standard.set(mode.rawValue, forKey: "runningAppsSortMode")
-            self.refreshRunningAppsPage()
+            self.rebuildRunningListItems()
+        }
+        toolbar.onSubmodeChange = { [weak self] sub in
+            guard let self else { return }
+            self.runningSubmode = sub
+            self.updateAppsSamplingState()
+            if sub == .ports { self.triggerPortScan() }
+            self.rebuildRunningListItems()
+        }
+        toolbar.onSearchChange = { [weak self] q in
+            guard let self else { return }
+            self.runningSearchQuery = q
+            self.rebuildRunningListItems()
+        }
+        toolbar.onRefreshPorts = { [weak self] in
+            self?.triggerPortScan()
         }
         accountStack.addArrangedSubview(toolbar)
+        if runningSubmode == .ports { triggerPortScan() }
+        rebuildRunningListItems()
+    }
 
+    private func rebuildRunningListItems() {
+        guard selectedPage == 2 else { return }
+        let q = runningSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        if runningSubmode == .ports {
+            let filtered = listeningPorts.filter { item in
+                guard !q.isEmpty else { return true }
+                return "\(item.port)".contains(q)
+                    || item.processName.lowercased().contains(q)
+                    || "\(item.pid)".contains(q)
+            }
+            runningToolbar?.updateSummary("监听 \(filtered.count) 个端口", submode: .ports, mode: runningAppsSortMode)
+            if filtered.isEmpty {
+                replaceRunningContent(with: [messageView(
+                    icon: "network",
+                    text: portScanTask != nil ? "正在扫描本机监听 TCP 端口…" : "没有匹配的监听端口",
+                    color: .secondaryLabelColor
+                )])
+            } else {
+                var rows: [NSView] = []
+                let identities = Set(listeningPorts.map(\.id))
+                portRows = portRows.filter { identities.contains($0.key) }
+                for item in filtered {
+                    let row: ListeningPortRowView
+                    if let existing = portRows[item.id] {
+                        row = existing
+                        row.update(item: item)
+                    } else {
+                        row = ListeningPortRowView(item: item)
+                        row.translatesAutoresizingMaskIntoConstraints = false
+                        row.widthAnchor.constraint(equalToConstant: Tokens.cardWidth).isActive = true
+                        row.heightAnchor.constraint(equalToConstant: 48).isActive = true
+                        portRows[item.id] = row
+                    }
+                    row.onTerminatePID = { [weak self] target in
+                        self?.confirmKillPortProcess(target)
+                    }
+                    rows.append(row)
+                }
+                replaceRunningContent(with: rows)
+            }
+            updatePreferredHeight()
+            return
+        }
+
+        if runningApps.isEmpty {
+            runningToolbar?.updateSummary("采样中…", submode: .apps, mode: runningAppsSortMode)
+            replaceRunningContent(with: [messageView(icon: "arrow.triangle.2.circlepath", text: "正在读取运行中应用…", color: .secondaryLabelColor)])
+            updatePreferredHeight()
+            return
+        }
         let sortedApps: [RunningApp]
         switch runningAppsSortMode {
         case .memory:
@@ -992,18 +1537,75 @@ final class QuotaPopoverViewController: NSViewController {
                 $0.localizedName.localizedStandardCompare($1.localizedName) == .orderedAscending
             }
         }
-        for app in sortedApps {
-            let row = RunningAppRowView(app: app)
-            row.translatesAutoresizingMaskIntoConstraints = false
-            row.widthAnchor.constraint(equalToConstant: Tokens.cardWidth).isActive = true
-            row.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        let filteredApps = sortedApps.filter { app in
+            guard !q.isEmpty else { return true }
+            return app.localizedName.lowercased().contains(q)
+                || (app.bundleIdentifier?.lowercased().contains(q) ?? false)
+        }
+        let totalMem = filteredApps.reduce(UInt64(0)) { $0 + $1.residentMemoryBytes }
+        let memStr = ByteCountFormatter.string(fromByteCount: Int64(min(totalMem, UInt64(Int64.max))), countStyle: .memory)
+        runningToolbar?.updateSummary("\(filteredApps.count) 个 · \(memStr)", submode: .apps, mode: runningAppsSortMode)
+
+        let identities = Set(runningApps.map(\.identity))
+        runningRows = runningRows.filter { identities.contains($0.key) }
+        var rows: [NSView] = []
+        for app in filteredApps {
+            let row: RunningAppRowView
+            if let existing = runningRows[app.identity] {
+                row = existing
+                row.update(app: app)
+            } else {
+                row = RunningAppRowView(app: app)
+                row.translatesAutoresizingMaskIntoConstraints = false
+                row.widthAnchor.constraint(equalToConstant: Tokens.cardWidth).isActive = true
+                row.heightAnchor.constraint(equalToConstant: 52).isActive = true
+                runningRows[app.identity] = row
+            }
             row.onKill = { [weak self] in self?.confirmForceQuit(app) }
-            accountStack.addArrangedSubview(row)
+            row.onGracefulQuit = { [weak self] in
+                guard let self else { return }
+                if self.runningAppsMonitor.terminateGracefully(app.identity) == .terminated {
+                    self.runningApps.removeAll { $0.identity == app.identity }
+                    self.rebuildRunningListItems()
+                }
+            }
+            rows.append(row)
+        }
+        if rows.isEmpty {
+            rows.append(messageView(icon: "magnifyingglass", text: "没有匹配的应用", color: .secondaryLabelColor))
+        }
+        replaceRunningContent(with: rows)
+        updatePreferredHeight()
+    }
+
+    private func replaceRunningContent(with rows: [NSView]) {
+        let current = accountStack.arrangedSubviews.filter { $0 !== runningToolbar }
+        guard current.count != rows.count || !zip(current, rows).allSatisfy({ $0 === $1 }) else { return }
+        for row in current {
+            accountStack.removeArrangedSubview(row)
+            row.removeFromSuperview()
+        }
+        rows.forEach { accountStack.addArrangedSubview($0) }
+    }
+
+    private func triggerPortScan() {
+        portScanTask?.cancel()
+        portScanTask = Task { [weak self] in
+            let targets = await Task.detached(priority: .userInitiated) {
+                ListeningPortProcessController.scan()
+            }.value
+            guard !Task.isCancelled, let self, self.selectedPage == 2 else { return }
+            self.portScanTask = nil
+            self.listeningPorts = targets.map(\.item)
+            self.portTargets = targets.reduce(into: [:]) { $0[$1.id] = $1 }
+            if self.runningSubmode == .ports {
+                self.rebuildRunningListItems()
+            }
         }
     }
 
     private func updateAppsSamplingState() {
-        guard isPopoverVisible, selectedPage == 2 else {
+        guard isPopoverVisible, selectedPage == 2, runningSubmode == .apps else {
             stopAppsSampling()
             return
         }
@@ -1029,11 +1631,37 @@ final class QuotaPopoverViewController: NSViewController {
 
     private func refreshRunningAppsPage() {
         guard selectedPage == 2 else { return }
-        accountStack.arrangedSubviews.forEach {
-            accountStack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
+        rebuildRunningListItems()
+    }
+
+    private func confirmKillPortProcess(_ item: ListeningPortItem) {
+        guard portTerminationTask == nil else { return }
+        guard let target = portTargets[item.id] else {
+            showActionError("进程快照已失效，请刷新端口列表后重试")
+            return
         }
-        renderRunningAppsPage()
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "结束监听端口 :\(item.port) 的进程？"
+        alert.informativeText = "将向 \(item.processName)（PID \(item.pid)）发送终止信号以释放端口。"
+        alert.addButton(withTitle: "释放端口")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        portTerminationTask = Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                ListeningPortProcessController.terminateSafely(target)
+            }.value
+            guard let self else { return }
+            self.portTerminationTask = nil
+            switch result {
+            case .success:
+                self.updatedLabel.stringValue = "已发送退出请求，正在重新检查端口"
+                try? await Task.sleep(for: .milliseconds(500))
+                if self.selectedPage == 2 { self.triggerPortScan() }
+            case .failure(let error):
+                self.showActionError(error.localizedDescription)
+            }
+        }
     }
 
     private func confirmForceQuit(_ app: RunningApp) {
@@ -1090,6 +1718,29 @@ final class QuotaPopoverViewController: NSViewController {
         if let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted]) {
             try? data.write(to: URL(fileURLWithPath: "/tmp/cpa-frames.json"))
         }
+        if let directory = ProcessInfo.processInfo.environment["SUPER_DASHBOARD_CAPTURE_DIR"] {
+            let destination = URL(fileURLWithPath: directory, isDirectory: true)
+            try? FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            view.layoutSubtreeIfNeeded()
+            let captureTargets: [(String, NSView)] = [("viewport", view), ("content", accountStack)]
+            for (name, target) in captureTargets {
+                guard target.bounds.width > 0, target.bounds.height > 0,
+                      let bitmap = target.bitmapImageRepForCachingDisplay(in: target.bounds) else { continue }
+                target.cacheDisplay(in: target.bounds, to: bitmap)
+                if let context = NSGraphicsContext(bitmapImageRep: bitmap) {
+                    NSGraphicsContext.saveGraphicsState()
+                    NSGraphicsContext.current = context
+                    target.effectiveAppearance.performAsCurrentDrawingAppearance {
+                        NSColor.windowBackgroundColor.setFill()
+                        NSRect(x: 0, y: 0, width: bitmap.pixelsWide, height: bitmap.pixelsHigh).fill(using: .destinationOver)
+                    }
+                    NSGraphicsContext.restoreGraphicsState()
+                }
+                if let data = bitmap.representation(using: .png, properties: [:]) {
+                    try? data.write(to: destination.appendingPathComponent("page-\(selectedPage)-\(name).png"))
+                }
+            }
+        }
     }
 
     private func makeHeader() -> NSView {
@@ -1104,7 +1755,7 @@ final class QuotaPopoverViewController: NSViewController {
         pageControl.controlSize = .large
         pageControl.font = .systemFont(ofSize: 11.5, weight: .semibold)
         pageControl.setAccessibilityLabel("页面切换")
-        pageControl.toolTip = "切换状态、运行应用、电源流向和储存清理页面"
+        pageControl.toolTip = "切换状态、运行、电源、清理、屏幕、工具、路由和用量"
 
         refreshButton.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "更多")
         refreshButton.imagePosition = .imageOnly
@@ -1126,10 +1777,11 @@ final class QuotaPopoverViewController: NSViewController {
         container.addSubview(refreshButton)
         container.addSubview(refreshSpin)
 
-        let pageWidth = pageControl.widthAnchor.constraint(equalToConstant: 292)
+        let pageWidth = pageControl.widthAnchor.constraint(equalToConstant: 338)
         pageControlWidthConstraint = pageWidth
         NSLayoutConstraint.activate([
-            pageControl.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            pageControl.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Tokens.padding),
+            pageControl.trailingAnchor.constraint(lessThanOrEqualTo: refreshButton.leadingAnchor, constant: -6),
             pageControl.centerYAnchor.constraint(equalTo: container.centerYAnchor),
             pageWidth,
             pageControl.heightAnchor.constraint(equalToConstant: 30),
@@ -1152,13 +1804,22 @@ final class QuotaPopoverViewController: NSViewController {
             updatedLabel.stringValue = "每 1 秒实时更新"
         case 2:
             headerTitleLabel.stringValue = "运行中"
-            updatedLabel.stringValue = "实时应用监测"
+            updatedLabel.stringValue = "应用与监听端口猎手"
         case 3:
             headerTitleLabel.stringValue = "电源流向"
             updatedLabel.stringValue = "Mac 每 1 秒 · 设备每 5 分钟"
+        case 7:
+            headerTitleLabel.stringValue = "快捷工具箱"
+            updatedLabel.stringValue = "音频守卫 · 演示净空 · 网络诊断"
+        case 8:
+            headerTitleLabel.stringValue = "屏幕"
+            updatedLabel.stringValue = ""
+        case 5, 6:
+            headerTitleLabel.stringValue = "服务器模型"
+            updatedLabel.stringValue = "Magpie · 服务器实时数据"
         default:
-            headerTitleLabel.stringValue = "清理储存空间"
-            updatedLabel.stringValue = "按需扫描 · 移入废纸篓"
+            headerTitleLabel.stringValue = cleanupMode == .memory ? "内存深度透视与清理" : "清理储存空间"
+            updatedLabel.stringValue = cleanupMode == .memory ? "四维内存拆解 · 无损安全释放" : "按需扫描 · 移入废纸篓"
         }
     }
 
@@ -1167,22 +1828,25 @@ final class QuotaPopoverViewController: NSViewController {
         let orderMode = defaults.string(forKey: "dashboardPageOrder") ?? "default"
         let baseOrder: [Int]
         switch orderMode {
-        case "powerFirst": baseOrder = [3, 1, 2, 4]
-        case "statusFirst": baseOrder = [1, 3, 2, 4]
-        case "cleanFirst": baseOrder = [4, 1, 2, 3]
-        default: baseOrder = [1, 2, 3, 4]
+        case "powerFirst": baseOrder = [3, 1, 2, 4, 8, 7]
+        case "statusFirst": baseOrder = [1, 3, 2, 4, 8, 7]
+        case "cleanFirst": baseOrder = [4, 1, 2, 3, 8, 7]
+        case "displayFirst": baseOrder = [8, 1, 3, 4, 2, 7]
+        case "toolsFirst": baseOrder = [7, 8, 1, 4, 3, 2]
+        default: baseOrder = [1, 2, 3, 4, 8, 7]
         }
-        segmentPages = baseOrder.filter { page in
+        segmentPages = (baseOrder + [5, 6]).filter { page in
             let key = "dashboardPageVisible\(page)"
             return defaults.object(forKey: key) as? Bool ?? true
         }
         if segmentPages.isEmpty { segmentPages = [1] }
         if !segmentPages.contains(selectedPage) { selectedPage = segmentPages[0] }
-        let labels = [1: "状态", 2: "运行", 3: "电源", 4: "清理"]
+        let labels = [1: "状态", 2: "运行", 3: "电源", 4: "清理", 8: "屏幕", 7: "工具", 5: "路由", 6: "用量"]
         pageControl.segmentCount = segmentPages.count
+        pageControl.font = .systemFont(ofSize: segmentPages.count >= 7 ? 10.5 : 11.5, weight: .semibold)
         pageControlWidthConstraint?.constant = min(
-            292,
-            max(128, CGFloat(segmentPages.count) * 78)
+            340,
+            max(128, CGFloat(segmentPages.count) * 56)
         )
         for (segment, page) in segmentPages.enumerated() {
             pageControl.setLabel(labels[page] ?? "", forSegment: segment)
@@ -1259,6 +1923,24 @@ final class QuotaPopoverViewController: NSViewController {
 
     @objc private func showMoreMenu(_ sender: NSButton) {
         let menu = NSMenu()
+        let pageItems: [(String, Int)] = [
+            ("系统状态", 1),
+            ("运行与端口", 2),
+            ("电源流向", 3),
+            ("内存与磁盘清理", 4),
+            ("显示器控制台", 8),
+            ("快捷工具箱", 7),
+            ("模型路由", 5),
+            ("用量概览", 6)
+        ]
+        for (title, p) in pageItems {
+            let item = NSMenuItem(title: title, action: #selector(jumpPageFromMoreMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = p
+            item.state = (selectedPage == p) ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
         let settingsItem = NSMenuItem(title: "设置…", action: #selector(settings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
@@ -1272,12 +1954,17 @@ final class QuotaPopoverViewController: NSViewController {
         )
     }
 
+    @objc private func jumpPageFromMoreMenu(_ sender: NSMenuItem) {
+        jumpToPage(sender.tag)
+    }
+
     @objc private func settings() { onSettings?() }
     @objc private func quit() { onQuit?() }
 }
 
 @MainActor
 final class SystemMetricCard: LiquidGlassCardView {
+    var onTap: ((SystemMetric.Kind) -> Void)?
     private let valueLabel = NSTextField(labelWithString: "")
     private let progress = QuotaProgressBar(value: 0, color: .secondaryLabelColor)
     private var kind: SystemMetric.Kind
@@ -1319,7 +2006,10 @@ final class SystemMetricCard: LiquidGlassCardView {
         icon.heightAnchor.constraint(equalToConstant: 16).isActive = true
         let title = NSTextField(labelWithString: metric.title)
         title.font = .systemFont(ofSize: 13, weight: .medium)
+        title.setContentCompressionResistancePriority(.required, for: .horizontal)
+        valueLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         valueLabel.font = .monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
+        valueLabel.lineBreakMode = .byTruncatingTail
         valueLabel.alignment = .right
         row.addArrangedSubview(icon)
         row.addArrangedSubview(title)
@@ -1341,10 +2031,24 @@ final class SystemMetricCard: LiquidGlassCardView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        let loc = convert(event.locationInWindow, from: nil)
+        if bounds.contains(loc) {
+            onTap?(kind)
+        }
+    }
+
     func update(_ metric: SystemMetric) {
         kind = metric.kind
         currentMetric = metric
-        valueLabel.stringValue = metric.detail
+        if metric.kind == .disk {
+            valueLabel.stringValue = metric.detail.components(separatedBy: "（").first ?? metric.detail
+        } else {
+            valueLabel.stringValue = metric.detail
+        }
+        valueLabel.toolTip = metric.detail
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: valueLabel.stringValue.count > 26 ? 12.5 : 15, weight: .semibold)
         valueLabel.textColor = color(for: metric)
         progress.update(value: metric.clampedValue ?? 0, color: color(for: metric), animated: !Tokens.reduceMotion)
         setAccessibilityRole(.group)
@@ -1373,6 +2077,7 @@ final class SystemMetricCard: LiquidGlassCardView {
         case .memory: return "memorychip"
         case .disk: return "internaldrive"
         case .power: return "bolt"
+        case .thermal: return "thermometer.medium"
         case .network: return "arrow.up.arrow.down"
         case .battery: return "battery.75percent"
         case .mouseBattery: return "computermouse"
@@ -1448,8 +2153,10 @@ final class AnchoredStatusPanel: NSPanel {
     private var clickEventMonitor: Any?
     private var localMouseMonitor: Any?
     private var keyEventMonitor: Any?
+    private weak var trackingPopupMenu: NSMenu?
     private var anchorScreenRect: NSRect?
     private weak var anchorScreen: NSScreen?
+    private var requestedSize = Tokens.popoverSize
 
     override var canBecomeKey: Bool { true }
     private var keepsOpenForDebugCapture: Bool { CommandLine.arguments.contains("--show") }
@@ -1469,24 +2176,40 @@ final class AnchoredStatusPanel: NSPanel {
         self.hasShadow = true
         self.contentViewController = contentViewController
         self.animationBehavior = .none // 自定义动画
+        self.isReleasedWhenClosed = false
+        NotificationCenter.default.addObserver(self, selector: #selector(popupOpening(_:)), name: NSPopUpButton.willPopUpNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(popupClosed(_:)), name: NSMenu.didEndTrackingNotification, object: nil)
+    }
 
-        setupEventMonitors()
+    @objc private func popupOpening(_ notification: Notification) {
+        let button = notification.object as? NSPopUpButton ?? (notification.object as? NSPopUpButtonCell)?.controlView as? NSPopUpButton
+        guard let button, button.window === self else { return }
+        trackingPopupMenu = button.menu
+    }
+
+    @objc private func popupClosed(_ notification: Notification) {
+        if notification.object as? NSMenu === trackingPopupMenu { trackingPopupMenu = nil }
+    }
+
+    var dismissesOnOutsideInteraction: Bool {
+        !keepsOpenForDebugCapture && trackingPopupMenu == nil && attachedSheet == nil
     }
 
     private func setupEventMonitors() {
+        guard clickEventMonitor == nil else { return }
         clickEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            self?.closePanel()
+            if self?.dismissesOnOutsideInteraction == true { self?.closePanel() }
         }
 
         localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
             guard let self, self.isVisible else { return event }
-            if event.window !== self { self.closePanel() }
+            if event.window !== self && event.window?.sheetParent !== self && self.dismissesOnOutsideInteraction { self.closePanel() }
             return event
         }
 
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard self?.isVisible == true else { return event }
-            if event.keyCode == 53 { // Escape
+            if event.keyCode == 53 && self?.trackingPopupMenu == nil && self?.attachedSheet == nil { // Escape
                 self?.closePanel()
                 return nil
             }
@@ -1497,42 +2220,64 @@ final class AnchoredStatusPanel: NSPanel {
     }
 
     @objc private func appDidResignActive() {
-        if !keepsOpenForDebugCapture { closePanel() }
+        if dismissesOnOutsideInteraction { closePanel() }
     }
 
     func closePanel() {
+        tearDownEventMonitors()
+        trackingPopupMenu = nil
         if isVisible {
             close()
-            if let vc = contentViewController as? QuotaPopoverViewController {
-                vc.setPopoverVisible(false)
-            }
+        }
+        if let vc = contentViewController as? QuotaPopoverViewController {
+            vc.setPopoverVisible(false)
         }
     }
 
-    func show(relativeTo button: NSStatusBarButton) {
-        guard let window = button.window else { return }
-
+    @discardableResult
+    func show(relativeTo button: NSStatusBarButton) -> Bool {
+        guard let window = button.window else { return false }
+        let capturesOffscreen = ProcessInfo.processInfo.environment["SUPER_DASHBOARD_CAPTURE_DIR"] != nil
         let buttonRect = button.convert(button.bounds, to: nil)
         let buttonScreenRect = window.convertToScreen(buttonRect)
-        let screen = screen(containing: buttonScreenRect, fallback: window.screen)
+        guard let screen = screen(containing: buttonScreenRect, fallback: window.screen) else { return false }
+        if !capturesOffscreen { setupEventMonitors() }
         anchorScreenRect = buttonScreenRect
         anchorScreen = screen
-        let target = frameFor(anchor: buttonScreenRect, on: screen, height: Tokens.popoverSize.height)
+        let target = frameFor(anchor: buttonScreenRect, on: screen, size: requestedSize)
         setFrame(target, display: false)
-        makeKeyAndOrderFront(nil)
+        if capturesOffscreen {
+            ignoresMouseEvents = true
+            contentView?.layoutSubtreeIfNeeded()
+        } else {
+            makeKeyAndOrderFront(nil)
+        }
+        return true
     }
 
-    private func screen(containing rect: NSRect, fallback: NSScreen?) -> NSScreen {
+    private func tearDownEventMonitors() {
+        for monitor in [clickEventMonitor, localMouseMonitor, keyEventMonitor].compactMap({ $0 }) {
+            NSEvent.removeMonitor(monitor)
+        }
+        clickEventMonitor = nil
+        localMouseMonitor = nil
+        keyEventMonitor = nil
+        NotificationCenter.default.removeObserver(self, name: NSApplication.didResignActiveNotification, object: nil)
+    }
+
+    private func screen(containing rect: NSRect, fallback: NSScreen?) -> NSScreen? {
         let point = NSPoint(x: rect.midX, y: rect.midY)
         return NSScreen.screens.first(where: { $0.frame.contains(point) })
             ?? fallback
             ?? NSScreen.main
-            ?? NSScreen.screens[0]
+            ?? NSScreen.screens.first
     }
 
-    private func frameFor(anchor: NSRect, on screen: NSScreen, height: CGFloat) -> NSRect {
-        let size = NSSize(width: Tokens.popoverSize.width, height: height)
+    private func frameFor(anchor: NSRect, on screen: NSScreen, size requested: NSSize) -> NSRect {
         let visible = screen.visibleFrame
+        let maxW = max(160, visible.width - 16)
+        let maxH = max(120, visible.height - 16)
+        let size = NSSize(width: max(160, min(requested.width, maxW)), height: max(120, min(requested.height, maxH)))
         let x = min(
             max(anchor.midX - size.width / 2, visible.minX + 8),
             visible.maxX - size.width - 8
@@ -1550,19 +2295,16 @@ final class AnchoredStatusPanel: NSPanel {
         return NSRect(x: x, y: y, width: size.width, height: size.height)
     }
 
-    func resizeContent(to height: CGFloat) {
-        let clamped = min(max(height, 260), Tokens.popoverSize.height)
-        guard abs(frame.height - clamped) > 1 else { return }
+    func resizeContent(to size: NSSize) {
+        requestedSize = size
         let target: NSRect
         if let anchorScreenRect, let anchorScreen {
-            target = frameFor(anchor: anchorScreenRect, on: anchorScreen, height: clamped)
+            target = frameFor(anchor: anchorScreenRect, on: anchorScreen, size: size)
         } else {
-            var fallback = frame
-            fallback.origin.y = frame.maxY - clamped
-            fallback.size.height = clamped
-            target = fallback
+            target = NSRect(x: frame.minX, y: frame.maxY - size.height, width: size.width, height: size.height)
         }
-        setFrame(target, display: true, animate: !Tokens.reduceMotion && isVisible)
+        guard abs(frame.width - target.width) > 1 || abs(frame.height - target.height) > 1 else { return }
+        setFrame(target, display: true, animate: false)
     }
 
     override func cancelOperation(_ sender: Any?) {
@@ -1571,6 +2313,6 @@ final class AnchoredStatusPanel: NSPanel {
 
     override func resignKey() {
         super.resignKey()
-        if !keepsOpenForDebugCapture { closePanel() }
+        if dismissesOnOutsideInteraction { closePanel() }
     }
 }

@@ -7,8 +7,10 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [.executable(name: "CPAQuotaBar", targets: ["CPAQuotaBar"])],
     targets: [
+        .systemLibrary(name: "RustDeskDisplayTopology", path: "Helpers/DisplayTopology"),
         .executableTarget(
             name: "CPAQuotaBar",
+            dependencies: ["RustDeskDisplayTopology"],
             path: "Sources/CPAQuotaBar",
             resources: [
                 .copy("Resources/libimobiledevice"),

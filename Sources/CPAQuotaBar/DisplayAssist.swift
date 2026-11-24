@@ -16,16 +16,21 @@ enum KeepAwakePreference {
 /// 通过 IOKit 断言阻止显示器休眠。用户开关会写入偏好；擦屏模式可临时加一层 hold。
 @MainActor
 final class KeepAwakeController {
+    var onStateChanged: (() -> Void)?
     private var assertionID: IOPMAssertionID = 0
     private var assertionActive = false
     private var temporaryHoldCount = 0
+    private var timedExpirationDate: Date?
+    private var timedExpirationTask: Task<Void, Never>?
     private let defaults: UserDefaults
 
     var isEnabled: Bool {
         get { KeepAwakePreference.load(from: defaults) }
         set {
+            cancelTimedAwake(sync: false)
             KeepAwakePreference.save(newValue, to: defaults)
             syncAssertion()
+            onStateChanged?()
         }
     }
 
@@ -33,8 +38,50 @@ final class KeepAwakeController {
         assertionActive
     }
 
+    var activeTimedRemainingMinutes: Int? {
+        guard let timedExpirationDate else { return nil }
+        let remaining = timedExpirationDate.timeIntervalSinceNow
+        guard remaining > 0 else { return nil }
+        return max(1, Int(ceil(remaining / 60)))
+    }
+
+    var statusSummary: String? {
+        if let mins = activeTimedRemainingMinutes {
+            return mins >= 60 ? "定时常亮剩余 \(mins / 60)h\(mins % 60)m" : "定时常亮剩余 \(mins) 分钟"
+        }
+        return isEnabled ? "屏幕常亮" : nil
+    }
+
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+    }
+
+    func startTimed(minutes: Int) {
+        guard minutes > 0 else { return }
+        KeepAwakePreference.save(false, to: defaults)
+        timedExpirationTask?.cancel()
+        let expiry = Date().addingTimeInterval(TimeInterval(minutes * 60))
+        timedExpirationDate = expiry
+        syncAssertion()
+        onStateChanged?()
+        timedExpirationTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(minutes * 60))
+            guard !Task.isCancelled, let self else { return }
+            self.timedExpirationDate = nil
+            self.timedExpirationTask = nil
+            self.syncAssertion()
+            self.onStateChanged?()
+        }
+    }
+
+    func cancelTimedAwake(sync: Bool = true) {
+        timedExpirationTask?.cancel()
+        timedExpirationTask = nil
+        timedExpirationDate = nil
+        if sync {
+            syncAssertion()
+            onStateChanged?()
+        }
     }
 
     func start() {
@@ -43,6 +90,7 @@ final class KeepAwakeController {
 
     func stop() {
         temporaryHoldCount = 0
+        cancelTimedAwake(sync: false)
         releaseAssertion()
     }
 
@@ -66,7 +114,8 @@ final class KeepAwakeController {
     }
 
     private func syncAssertion() {
-        if isEnabled || temporaryHoldCount > 0 {
+        let timedActive = (timedExpirationDate?.timeIntervalSinceNow ?? -1) > 0
+        if isEnabled || temporaryHoldCount > 0 || timedActive {
             takeAssertion()
         } else {
             releaseAssertion()
@@ -79,7 +128,7 @@ final class KeepAwakeController {
         let status = IOPMAssertionCreateWithName(
             kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
             IOPMAssertionLevel(kIOPMAssertionLevelOn),
-            "马氏超级仪表盘 屏幕常亮" as CFString,
+            "Super Dashboard 屏幕常亮" as CFString,
             &identifier
         )
         guard status == kIOReturnSuccess else { return }
@@ -95,21 +144,26 @@ final class KeepAwakeController {
     }
 }
 
-/// 全屏浅色遮罩，方便擦拭屏幕；点击不会落到下层窗口，按 Esc 退出。
+/// 全屏遮罩，方便擦拭屏幕；点击不会落到下层窗口，按 Esc 退出。
 @MainActor
 final class ScreenCleanModeController {
     var onDidExit: (() -> Void)?
     private(set) var isActive = false
+    private var cursorHidden = false
     private var windows: [NSWindow] = []
     private var localKeyMonitor: Any?
     private var globalKeyMonitor: Any?
     private var screenObserver: NSObjectProtocol?
+    private var sleepObservers: [NSObjectProtocol] = []
 
     func enter() {
         guard !isActive else { return }
         isActive = true
         presentOverlays()
-        NSCursor.hide()
+        if !cursorHidden {
+            NSCursor.hide()
+            cursorHidden = true
+        }
         NSApp.activate(ignoringOtherApps: true)
         windows.first?.makeKeyAndOrderFront(nil)
 
@@ -126,14 +180,24 @@ final class ScreenCleanModeController {
             }
         }
         screenObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification,
+            forName: DisplaySafetyPolicy.physicalScreenParametersNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.isActive else { return }
-                self.presentOverlays()
+                if NSScreen.screens.isEmpty {
+                    self.exit()
+                } else {
+                    self.presentOverlays()
+                }
             }
+        }
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification] {
+            sleepObservers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.exit() }
+            })
         }
     }
 
@@ -143,7 +207,10 @@ final class ScreenCleanModeController {
         tearDownMonitors()
         windows.forEach { $0.orderOut(nil) }
         windows.removeAll()
-        NSCursor.unhide()
+        if cursorHidden {
+            NSCursor.unhide()
+            cursorHidden = false
+        }
         onDidExit?()
     }
 
@@ -193,21 +260,24 @@ final class ScreenCleanModeController {
             NotificationCenter.default.removeObserver(screenObserver)
             self.screenObserver = nil
         }
+        sleepObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+        sleepObservers.removeAll()
     }
 }
 
 @MainActor
 private final class ScreenCleanOverlayView: NSView {
     private let onExit: () -> Void
+    private let hint = NSTextField(labelWithString: "擦屏模式生效中 · 按 Esc 退出")
+    private var fadeTask: Task<Void, Never>?
 
     init(onExit: @escaping () -> Void) {
         self.onExit = onExit
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        let hint = NSTextField(labelWithString: "擦屏模式 · 按 Esc 退出")
         hint.font = .systemFont(ofSize: 14, weight: .medium)
-        hint.textColor = NSColor.white.withAlphaComponent(0.22)
+        hint.textColor = NSColor.white.withAlphaComponent(0.28)
         hint.alignment = .center
         hint.translatesAutoresizingMaskIntoConstraints = false
         addSubview(hint)
@@ -226,12 +296,22 @@ private final class ScreenCleanOverlayView: NSView {
             onExit()
             return
         }
-        super.keyDown(with: event)
+        flashHint()
     }
 
-    override func mouseDown(with event: NSEvent) {}
-    override func rightMouseDown(with event: NSEvent) {}
-    override func otherMouseDown(with event: NSEvent) {}
+    private func flashHint() {
+        hint.textColor = NSColor.white.withAlphaComponent(0.88)
+        fadeTask?.cancel()
+        fadeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(1400))
+            guard !Task.isCancelled else { return }
+            self?.hint.textColor = NSColor.white.withAlphaComponent(0.28)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) { flashHint() }
+    override func rightMouseDown(with event: NSEvent) { flashHint() }
+    override func otherMouseDown(with event: NSEvent) { flashHint() }
 }
 
 enum PowerFlowGeometry {

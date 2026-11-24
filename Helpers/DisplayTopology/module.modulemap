@@ -1,0 +1,4 @@
+module RustDeskDisplayTopology [system] {
+    header "../RDDisplayTopology.h"
+    export *
+}

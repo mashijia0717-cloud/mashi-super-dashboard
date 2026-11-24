@@ -22,6 +22,7 @@ private enum PowerPalette {
 @MainActor
 final class PowerFlowDashboardView: NSView {
     var onHeightChanged: (() -> Void)?
+    var onRefreshNearbyDevices: (() -> Void)?
     private let limitPill = PowerStatusPill()
     private let modePill = PowerStatusPill()
     private let adapterPill = PowerStatusPill()
@@ -36,8 +37,9 @@ final class PowerFlowDashboardView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         widthAnchor.constraint(equalToConstant: 372).isActive = true
+        let initialNearbyHeight = nearbyBatteryBars.preferredHeight
         let dashboardHeight = heightAnchor.constraint(
-            equalToConstant: nearbyBatteryBars.isExpanded ? 528 : 436
+            equalToConstant: 464 + (initialNearbyHeight - 34)
         )
         dashboardHeight.isActive = true
         dashboardHeightConstraint = dashboardHeight
@@ -54,24 +56,20 @@ final class PowerFlowDashboardView: NSView {
         batteryBar.heightAnchor.constraint(equalToConstant: 38).isActive = true
         nearbyBatteryBars.translatesAutoresizingMaskIntoConstraints = false
         let nearbyHeight = nearbyBatteryBars.heightAnchor.constraint(
-            equalToConstant: nearbyBatteryBars.isExpanded ? 126 : 34
+            equalToConstant: initialNearbyHeight
         )
         nearbyHeight.isActive = true
         nearbyHeightConstraint = nearbyHeight
-        nearbyBatteryBars.onExpansionChanged = { [weak self] expanded in
-            guard let self else { return }
-            self.nearbyHeightConstraint?.constant = expanded ? 126 : 34
-            self.dashboardHeightConstraint?.constant = expanded ? 528 : 436
-            self.invalidateIntrinsicContentSize()
-            self.superview?.layoutSubtreeIfNeeded()
-            DispatchQueue.main.async { [weak self] in
-                self?.onHeightChanged?()
-            }
+        nearbyBatteryBars.onExpansionChanged = { [weak self] _ in
+            self?.syncLayoutHeights(notify: true)
+        }
+        nearbyBatteryBars.onRefreshRequested = { [weak self] in
+            self?.onRefreshNearbyDevices?()
         }
         flowView.translatesAutoresizingMaskIntoConstraints = false
         flowView.heightAnchor.constraint(equalToConstant: 132).isActive = true
         detailsCard.translatesAutoresizingMaskIntoConstraints = false
-        detailsCard.heightAnchor.constraint(equalToConstant: 160).isActive = true
+        detailsCard.heightAnchor.constraint(equalToConstant: 188).isActive = true
 
         let stack = NSStackView(views: [stateRow, batteryBar, nearbyBatteryBars, flowView, detailsCard])
         stack.orientation = .vertical
@@ -127,13 +125,19 @@ final class PowerFlowDashboardView: NSView {
         adapterPill.update(title: adapter, symbol: "powerplug.fill")
 
         batteryBar.update(snapshot)
-        nearbyBatteryBars.update(snapshot.nearbyDevices)
+        nearbyBatteryBars.update(snapshot.nearbyDevices, peripherals: snapshot.wirelessPeripherals)
+        syncLayoutHeights(notify: true)
         flowView.update(snapshot)
         detailsCard.update(snapshot)
 
         setAccessibilityRole(.group)
         setAccessibilityLabel("电源流向")
         setAccessibilityValue("\(percent(snapshot.batteryLevel))，\(routing.title)")
+    }
+
+    func setAnimationsActive(_ active: Bool) {
+        batteryBar.setAnimationsActive(active)
+        flowView.setAnimationsActive(active)
     }
 
     private func openBatterySettings() {
@@ -154,17 +158,45 @@ final class PowerFlowDashboardView: NSView {
     private func percent(_ value: Double?) -> String {
         value.map { "\(Int(($0 * 100).rounded()))%" } ?? "电量未知"
     }
+
+    private func syncLayoutHeights(notify: Bool) {
+        let nearbyHeight = nearbyBatteryBars.preferredHeight
+        let dashHeight = 464 + (nearbyHeight - 34)
+        let changed = nearbyHeightConstraint?.constant != nearbyHeight
+            || dashboardHeightConstraint?.constant != dashHeight
+        nearbyHeightConstraint?.constant = nearbyHeight
+        dashboardHeightConstraint?.constant = dashHeight
+        guard changed else { return }
+        invalidateIntrinsicContentSize()
+        superview?.layoutSubtreeIfNeeded()
+        if notify {
+            DispatchQueue.main.async { [weak self] in
+                self?.onHeightChanged?()
+            }
+        }
+    }
 }
 
 @MainActor
 private final class NearbyDeviceBatteryGroupView: NSView {
     private var rows: [NearbyAppleDeviceKind: NearbyDeviceBatteryBarView] = [:]
+    private var peripheralRowIDs: [String] = []
+    private var peripheralRows: [NearbyDeviceBatteryBarView] = []
     private let rowsStack = NSStackView()
+    private let refreshButton = NSButton()
     private let disclosure = NSButton()
     var onExpansionChanged: ((Bool) -> Void)?
+    var onRefreshRequested: (() -> Void)?
     private(set) var isExpanded = UserDefaults.standard.object(
         forKey: "nearbyDevicesExpanded"
     ) as? Bool ?? true
+
+    var preferredHeight: CGFloat {
+        guard isExpanded else { return 34 }
+        let totalRows = NearbyAppleDeviceKind.allCases.count + peripheralRows.count
+        let rowsHeight = CGFloat(totalRows) * 28 + CGFloat(max(0, totalRows - 1)) * 5
+        return 32 + rowsHeight
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -176,21 +208,29 @@ private final class NearbyDeviceBatteryGroupView: NSView {
         rowsStack.setViews(rowViews, in: .top)
         rowsStack.orientation = .vertical
         rowsStack.alignment = .width
-        rowsStack.distribution = .fillEqually
+        rowsStack.distribution = .fill
         rowsStack.spacing = 5
 
-        let title = NSTextField(labelWithString: "附近设备")
+        let title = NSTextField(labelWithString: "附近与外设")
         title.font = .systemFont(ofSize: 11.5, weight: .semibold)
         title.textColor = PowerPalette.secondary
         let headerSpacer = NSView()
         headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        refreshButton.isBordered = false
+        refreshButton.bezelStyle = .inline
+        refreshButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "立即刷新附近设备与无线外设")
+        refreshButton.contentTintColor = PowerPalette.secondary
+        refreshButton.toolTip = "立即重新扫描已配对的 Apple 设备及蓝牙/无线外设电量"
+        refreshButton.target = self
+        refreshButton.action = #selector(refreshTapped)
         disclosure.isBordered = false
         disclosure.bezelStyle = .inline
         disclosure.target = self
         disclosure.action = #selector(toggleExpanded)
-        let header = NSStackView(views: [title, headerSpacer, disclosure])
+        let header = NSStackView(views: [title, headerSpacer, refreshButton, disclosure])
         header.orientation = .horizontal
         header.alignment = .centerY
+        header.spacing = 6
         header.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
         let stack = NSStackView(views: [header, rowsStack])
@@ -210,10 +250,28 @@ private final class NearbyDeviceBatteryGroupView: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func update(_ devices: [NearbyAppleDeviceBattery]) {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    func update(_ devices: [NearbyAppleDeviceBattery], peripherals: [WirelessPeripheralBattery] = []) {
         let values = Dictionary(uniqueKeysWithValues: devices.map { ($0.kind, $0) })
         for kind in NearbyAppleDeviceKind.allCases {
             rows[kind]?.update(values[kind] ?? .placeholder(for: kind))
+        }
+        let incomingIDs = peripherals.map(\.id)
+        if incomingIDs != peripheralRowIDs {
+            for old in peripheralRows {
+                rowsStack.removeArrangedSubview(old)
+                old.removeFromSuperview()
+            }
+            peripheralRows = peripherals.map { item in
+                let row = NearbyDeviceBatteryBarView(symbol: item.symbol, title: item.name)
+                rowsStack.addArrangedSubview(row)
+                return row
+            }
+            peripheralRowIDs = incomingIDs
+        }
+        for (row, item) in zip(peripheralRows, peripherals) {
+            row.updatePeripheral(item)
         }
     }
 
@@ -224,6 +282,10 @@ private final class NearbyDeviceBatteryGroupView: NSView {
         onExpansionChanged?(isExpanded)
     }
 
+    @objc private func refreshTapped() {
+        onRefreshRequested?()
+    }
+
     private func applyExpansion() {
         rowsStack.isHidden = !isExpanded
         disclosure.image = NSImage(
@@ -231,7 +293,7 @@ private final class NearbyDeviceBatteryGroupView: NSView {
             accessibilityDescription: nil
         )
         disclosure.contentTintColor = PowerPalette.secondary
-        disclosure.setAccessibilityLabel(isExpanded ? "折叠附近设备" : "展开附近设备")
+        disclosure.setAccessibilityLabel(isExpanded ? "折叠附近与外设" : "展开附近与外设")
     }
 }
 
@@ -244,9 +306,14 @@ private final class NearbyDeviceBatteryBarView: NSView {
     private let valueLabel = NSTextField(labelWithString: "正在搜索…")
     private var level: Double?
 
-    init(kind: NearbyAppleDeviceKind) {
+    convenience init(kind: NearbyAppleDeviceKind) {
+        self.init(symbol: kind.symbolName, title: kind.displayName)
+    }
+
+    init(symbol: String, title: String) {
         super.init(frame: .zero)
         wantsLayer = true
+        heightAnchor.constraint(equalToConstant: 28).isActive = true
 
         track.backgroundColor = PowerPalette.cg(PowerPalette.track, in: self)
         track.borderColor = PowerPalette.cg(PowerPalette.border, in: self)
@@ -261,12 +328,12 @@ private final class NearbyDeviceBatteryBarView: NSView {
         fill.endPoint = CGPoint(x: 1, y: 0.5)
         layer?.addSublayer(fill)
 
-        icon.image = NSImage(systemSymbolName: kind.symbolName, accessibilityDescription: nil)
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         icon.contentTintColor = PowerPalette.secondary
         icon.symbolConfiguration = .init(pointSize: 11, weight: .semibold)
         icon.translatesAutoresizingMaskIntoConstraints = false
 
-        nameLabel.stringValue = kind.displayName
+        nameLabel.stringValue = title
         nameLabel.font = .systemFont(ofSize: 10.5, weight: .semibold)
         nameLabel.textColor = PowerPalette.primary
         nameLabel.lineBreakMode = .byTruncatingMiddle
@@ -293,7 +360,7 @@ private final class NearbyDeviceBatteryBarView: NSView {
             valueLabel.leadingAnchor.constraint(greaterThanOrEqualTo: nameLabel.trailingAnchor, constant: 8)
         ])
         setAccessibilityRole(.progressIndicator)
-        setAccessibilityLabel(kind.displayName)
+        setAccessibilityLabel(title)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -341,6 +408,23 @@ private final class NearbyDeviceBatteryBarView: NSView {
         setAccessibilityValue(valueLabel.stringValue)
         needsLayout = true
     }
+
+    func updatePeripheral(_ item: WirelessPeripheralBattery) {
+        let clampedPercent = min(max(item.percent, 0), 100)
+        icon.image = NSImage(systemSymbolName: item.symbol, accessibilityDescription: nil)
+        icon.contentTintColor = clampedPercent <= 20 ? .systemRed : PowerPalette.secondary
+        nameLabel.stringValue = item.name
+        level = Double(clampedPercent) / 100.0
+        valueLabel.stringValue = item.isCharging ? "\(clampedPercent)% 充电中" : "\(clampedPercent)%"
+        valueLabel.textColor = clampedPercent <= 20 ? .systemRed : PowerPalette.primary
+        toolTip = item.isCharging ? "\(item.name) · 充电中（\(clampedPercent)%）" : "\(item.name) · 剩余电量 \(clampedPercent)%"
+        fill.colors = clampedPercent <= 20
+            ? [NSColor.systemRed.withAlphaComponent(0.55).cgColor, NSColor.systemOrange.withAlphaComponent(0.30).cgColor]
+            : [NSColor.systemBlue.withAlphaComponent(0.44).cgColor, NSColor.systemTeal.withAlphaComponent(0.25).cgColor]
+        setAccessibilityLabel(item.name)
+        setAccessibilityValue(valueLabel.stringValue)
+        needsLayout = true
+    }
 }
 
 @MainActor
@@ -384,6 +468,8 @@ private final class PowerStatusPill: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         applyMenuChrome()
@@ -404,8 +490,11 @@ private final class PowerStatusPill: NSView {
 
     // 图标和文字是子视图；将命中测试统一收敛到胶囊本身，避免点到文字时
     // 事件被 NSTextField/NSImageView 吃掉，导致“点击电池设置”偶尔无效。
+    // 注意：point 是父视图坐标系，需先转本地再判定，且不能吞掉范围外的点击。
     override func hitTest(_ point: NSPoint) -> NSView? {
-        onClick == nil ? super.hitTest(point) : self
+        guard onClick != nil else { return super.hitTest(point) }
+        let local = superview.map { convert(point, from: $0) } ?? point
+        return bounds.contains(local) ? self : nil
     }
 
     override func resetCursorRects() {
@@ -432,6 +521,7 @@ private final class BatteryChargeBarView: NSView {
     private let powerIcon = NSImageView()
     private var level: Double = 0
     private var isCharging = false
+    private var animationsAllowed = true
     private var chargingMotionActive = false
 
     override init(frame: NSRect) {
@@ -544,8 +634,19 @@ private final class BatteryChargeBarView: NSView {
         shimmer.frame = fill.bounds
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateChargingMotion()
+    }
+
+    func setAnimationsActive(_ active: Bool) {
+        guard animationsAllowed != active else { return }
+        animationsAllowed = active
+        updateChargingMotion()
+    }
+
     private func updateChargingMotion() {
-        let shouldAnimate = isCharging && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let shouldAnimate = animationsAllowed && window != nil && isCharging && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         guard shouldAnimate != chargingMotionActive else { return }
         chargingMotionActive = shouldAnimate
         powerIcon.layer?.removeAnimation(forKey: "boltPulse")
@@ -574,6 +675,15 @@ private final class BatteryChargeBarView: NSView {
 }
 
 @MainActor
+private final class DisplayLinkWeakProxy: NSObject {
+    weak var owner: PowerFlowCanvasView?
+    init(_ owner: PowerFlowCanvasView) { self.owner = owner }
+    @objc func tick(_ link: CADisplayLink) {
+        owner?.stepFlowAnimation(link)
+    }
+}
+
+@MainActor
 private final class PowerFlowCanvasView: NSView {
     private let source = PowerFlowNodeView(symbol: "powerplug.fill", accent: .systemYellow)
     private let system = PowerFlowNodeView(symbol: "laptopcomputer", accent: .systemBlue)
@@ -583,6 +693,7 @@ private final class PowerFlowCanvasView: NSView {
     private let other = PowerFlowNodeView(symbol: "ellipsis", accent: .secondaryLabelColor)
     private var snapshot = PowerFlowSnapshot.placeholder
     private var displayLink: CADisplayLink?
+    private var animationsAllowed = true
     private var flowPhase: CGFloat = 0
     private var lastFrameTimestamp: CFTimeInterval = 0
 
@@ -596,8 +707,27 @@ private final class PowerFlowCanvasView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        syncAnimationState()
+    }
+
+    func setAnimationsActive(_ active: Bool) {
+        guard animationsAllowed != active else { return }
+        animationsAllowed = active
+        syncAnimationState()
+        if !active {
+            source.setChargingPulse(false)
+            battery.setChargingPulse(false)
+        } else {
+            update(snapshot)
+        }
+    }
+
+    private func syncAnimationState() {
         stopFlowAnimation()
-        guard window != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+        guard animationsAllowed,
+              let window,
+              window.isVisible || window.occlusionState.contains(.visible),
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
             needsDisplay = true
             return
         }
@@ -605,7 +735,8 @@ private final class PowerFlowCanvasView: NSView {
     }
 
     private func startFlowAnimation() {
-        let link = displayLink(target: self, selector: #selector(stepFlowAnimation(_:)))
+        let proxy = DisplayLinkWeakProxy(self)
+        let link = displayLink(target: proxy, selector: #selector(DisplayLinkWeakProxy.tick(_:)))
         link.preferredFrameRateRange = CAFrameRateRange(minimum: 20, maximum: 30, preferred: 24)
         link.add(to: .main, forMode: .common)
         displayLink = link
@@ -618,7 +749,11 @@ private final class PowerFlowCanvasView: NSView {
         lastFrameTimestamp = 0
     }
 
-    @objc private func stepFlowAnimation(_ link: CADisplayLink) {
+    fileprivate func stepFlowAnimation(_ link: CADisplayLink) {
+        guard animationsAllowed, window?.isVisible == true else {
+            stopFlowAnimation()
+            return
+        }
         let now = CACurrentMediaTime()
         let dt = lastFrameTimestamp == 0 ? link.duration : max(now - lastFrameTimestamp, 0)
         lastFrameTimestamp = now
@@ -916,11 +1051,11 @@ private final class PowerFlowCanvasView: NSView {
         cpu.update(title: "CPU", value: watts(snapshot.cpuWatts))
         gpu.update(title: "GPU", value: watts(snapshot.gpuWatts))
         other.update(title: "其他", value: watts(snapshot.otherWatts))
-        source.setChargingPulse(snapshot.externalConnected && routing.adapterOutputWatts > 0)
+        source.setChargingPulse(animationsAllowed && snapshot.externalConnected && routing.adapterOutputWatts > 0)
         battery.setChargingPulse(
-            routing.mode == .adapterCharging ||
+            animationsAllowed && (routing.mode == .adapterCharging ||
             routing.mode == .batteryOnly ||
-            routing.mode == .adapterWithBatteryAssist
+            routing.mode == .adapterWithBatteryAssist)
         )
         source.setActive(snapshot.externalConnected)
         system.setActive(routing.mode != .batteryOnly)
@@ -928,6 +1063,9 @@ private final class PowerFlowCanvasView: NSView {
         cpu.setActive(powerIsAvailable(snapshot.cpuWatts))
         gpu.setActive(powerIsAvailable(snapshot.gpuWatts))
         other.setActive(powerIsAvailable(snapshot.otherWatts))
+        if animationsAllowed && displayLink == nil && window?.isVisible == true {
+            syncAnimationState()
+        }
         needsDisplay = true
     }
 
@@ -1049,8 +1187,9 @@ private final class PowerFlowNodeView: NSView {
 
 @MainActor
 private final class PowerDetailsCardView: LiquidGlassCardView {
-    private let temperature = PowerDetailRow(symbol: "thermometer.medium", title: "电池温度")
-    private let fullTime = PowerDetailRow(symbol: "clock", title: "充满时间")
+    private let temperature = PowerDetailRow(symbol: "thermometer.medium", title: "电池 / 芯片温度")
+    private let fullTime = PowerDetailRow(symbol: "clock", title: "充满 / 续航预估")
+    private let health = PowerDetailRow(symbol: "heart.text.square", title: "电池健康 / 循环")
     private let systemPower = PowerDetailRow(symbol: "laptopcomputer", title: "系统功率")
     private let lowPower = PowerDetailRow(symbol: "battery.25percent", title: "低电量模式")
     private let adapter = PowerDetailRow(symbol: "powerplug.fill", title: "输入功率 / 能力")
@@ -1060,7 +1199,7 @@ private final class PowerDetailsCardView: LiquidGlassCardView {
 
         let firstSeparator = separator()
         let secondSeparator = separator()
-        let stack = NSStackView(views: [temperature, fullTime, firstSeparator, systemPower, lowPower, secondSeparator, adapter])
+        let stack = NSStackView(views: [temperature, fullTime, health, firstSeparator, systemPower, lowPower, secondSeparator, adapter])
         stack.orientation = .vertical
         stack.alignment = .width
         stack.spacing = 0
@@ -1080,24 +1219,42 @@ private final class PowerDetailsCardView: LiquidGlassCardView {
 
     func update(_ snapshot: PowerFlowSnapshot) {
         let routing = PowerFlowRouting(snapshot: snapshot)
-        temperature.value = snapshot.temperatureCelsius.map { String(format: "%.1f°C", $0) } ?? "--"
+        let tempParts = [
+            snapshot.temperatureCelsius.map { String(format: "电池 %.1f°C", $0) },
+            snapshot.cpuTemperatureCelsius.map { String(format: "CPU %.0f°C", $0) }
+        ].compactMap { $0 }
+        temperature.value = tempParts.isEmpty ? "--" : tempParts.joined(separator: " · ")
 
         switch routing.mode {
         case .adapterCharging:
             if let minutes = snapshot.timeToFullMinutes {
-                fullTime.value = "\(minutes / 60)小时\(minutes % 60)分钟"
+                fullTime.value = "充满还需 \(minutes / 60)小时\(minutes % 60)分钟"
             } else {
                 fullTime.value = "计算中"
             }
         case .adapterDirect:
-            fullTime.value = "充电已暂停"
+            fullTime.value = (snapshot.batteryLevel ?? 0) >= 0.99 ? "已充满（直供）" : "充电已暂停（直供）"
         case .batteryOnly:
-            fullTime.value = "未连接电源"
+            if let minutes = snapshot.timeToEmptyMinutes {
+                fullTime.value = "预计续航 \(minutes / 60)小时\(minutes % 60)分钟"
+            } else {
+                fullTime.value = "电池供电（估算中）"
+            }
         case .adapterWithBatteryAssist:
             fullTime.value = "电池正在辅助供电"
         }
 
-        systemPower.value = watts(routing.systemLoadWatts)
+        let healthParts = [
+            snapshot.batteryHealthPercent.map { "\($0)%" },
+            snapshot.cycleCount.map { "\($0) 次循环" }
+        ].compactMap { $0 }
+        health.value = healthParts.isEmpty ? "--" : healthParts.joined(separator: " · ")
+
+        if let usb = snapshot.usbOutputWatts {
+            systemPower.value = "\(watts(routing.systemLoadWatts)) · USB \(String(format: "%.1f W", usb))"
+        } else {
+            systemPower.value = watts(routing.systemLoadWatts)
+        }
         lowPower.value = snapshot.lowPowerMode ? "已开启" : "已关闭"
 
         let actualInput: Double?
@@ -1108,8 +1265,16 @@ private final class PowerDetailsCardView: LiquidGlassCardView {
         } else {
             actualInput = nil
         }
+        let pdSpec: String = {
+            if snapshot.externalConnected,
+               let v = snapshot.adapterVoltageVolts,
+               let a = snapshot.adapterCurrentAmps {
+                return String(format: " (%.0fV·%.1fA)", v, a)
+            }
+            return ""
+        }()
         if let input = actualInput, let maximum = snapshot.adapterWatts {
-            adapter.value = "\(String(format: "%.1f W", input)) / \(Int(maximum.rounded())) W"
+            adapter.value = "\(String(format: "%.1f W", input)) / \(Int(maximum.rounded())) W\(pdSpec)"
         } else {
             adapter.value = watts(actualInput ?? snapshot.adapterWatts)
         }

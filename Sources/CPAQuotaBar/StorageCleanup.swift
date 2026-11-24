@@ -76,10 +76,11 @@ enum StorageCleanupService {
         var traversalBudget = maxTraversalFiles
 
         for target in targets {
+            guard shouldContinue() else { break }
             guard !targetIsActive(target.path, runningBundleIdentifiers: runningBundleIdentifiers) else { continue }
             guard let root = safeURL(path: target.path, homePath: homePath) else { continue }
             let urls = matchingURLs(root: root, mode: target.mode)
-            let measuredSizes = measureSizes(of: urls)
+            let measuredSizes = measureSizes(of: urls, shouldContinue: shouldContinue)
             for url in urls {
                 if !shouldContinue() { break }
                 if target.categoryID == "userCaches",
@@ -187,15 +188,22 @@ enum StorageCleanupService {
             StorageCleanupTarget(categoryID: "browserCaches", path: path("Library", "Caches", "com.microsoft.edgemac"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "browserCaches", path: path("Library", "Caches", "org.mozilla.firefox"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "browserCaches", path: path("Library", "Caches", "BraveSoftware", "Brave-Browser"), mode: .directChildren),
+            StorageCleanupTarget(categoryID: "browserCaches", path: path("Library", "Caches", "Arc"), mode: .directChildren),
+            StorageCleanupTarget(categoryID: "browserCaches", path: path("Library", "Caches", "com.vivaldi.Vivaldi"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "developerCaches", path: path("Library", "Developer", "Xcode", "DerivedData"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "developerCaches", path: path("Library", "Developer", "CoreSimulator", "Caches"), mode: .directChildren),
+            StorageCleanupTarget(categoryID: "developerCaches", path: path("Library", "Caches", "org.swift.swiftpm"), mode: .directChildren),
+            StorageCleanupTarget(categoryID: "developerCaches", path: path("Library", "Caches", "CocoaPods"), mode: .directChildren),
+            StorageCleanupTarget(categoryID: "developerCaches", path: path("Library", "pnpm", "store"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "developerCaches", path: path(".npm", "_cacache"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "developerCaches", path: path(".cache", "pip"), mode: .directChildren),
+            StorageCleanupTarget(categoryID: "developerCaches", path: path(".cache", "uv"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "developerCaches", path: path(".cache", "yarn"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "developerCaches", path: path(".gradle", "caches"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "developerCaches", path: path(".cargo", "registry", "cache"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "developerCaches", path: path("Library", "Caches", "Homebrew"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "logs", path: path("Library", "Logs"), mode: .directChildren),
+            StorageCleanupTarget(categoryID: "logs", path: path("Library", "Logs", "CoreSimulator"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "logs", path: path("Library", "DiagnosticReports"), mode: .directChildren),
             StorageCleanupTarget(categoryID: "downloads", path: path("Downloads"), mode: .matchingSuffixes([".download", ".crdownload", ".part", ".tmp"]))
         ]
@@ -203,19 +211,25 @@ enum StorageCleanupService {
 
     private static let genericCacheExclusions: Set<String> = [
         "Google", "BraveSoftware", "com.apple.Safari", "com.microsoft.edgemac",
-        "org.mozilla.firefox", "Homebrew", "Code", "CocoaPods", "Chromium"
+        "org.mozilla.firefox", "Homebrew", "Code", "CocoaPods", "Chromium",
+        "Arc", "com.vivaldi.Vivaldi", "org.swift.swiftpm", "CloudKit", "FamilyCircle"
+    ]
+
+    private static let browserCacheRules: [(pathMarker: String, bundleID: String)] = [
+        ("/Library/Caches/com.apple.Safari", "com.apple.Safari"),
+        ("/Library/Caches/Google/Chrome", "com.google.Chrome"),
+        ("/Library/Caches/com.microsoft.edgemac", "com.microsoft.edgemac"),
+        ("/Library/Caches/org.mozilla.firefox", "org.mozilla.firefox"),
+        ("/Library/Caches/BraveSoftware/Brave-Browser", "com.brave.Browser"),
+        ("/Library/Caches/Arc", "company.thebrowser.Browser"),
+        ("/Library/Caches/com.vivaldi.Vivaldi", "com.vivaldi.Vivaldi")
     ]
 
     private static func targetIsActive(
         _ path: String,
         runningBundleIdentifiers: Set<String>
     ) -> Bool {
-        let blocked: [(String, String)] = [
-            ("/Library/Caches/com.apple.Safari", "com.apple.Safari"),
-            ("/Library/Caches/Google/Chrome", "com.google.Chrome"),
-            ("/Library/Caches/com.microsoft.edgemac", "com.microsoft.edgemac"),
-            ("/Library/Caches/org.mozilla.firefox", "org.mozilla.firefox"),
-            ("/Library/Caches/BraveSoftware/Brave-Browser", "com.brave.Browser"),
+        let blocked: [(String, String)] = browserCacheRules + [
             ("/Library/Developer/Xcode/DerivedData", "com.apple.dt.Xcode"),
             ("/Library/Developer/CoreSimulator/Caches", "com.apple.dt.Xcode")
         ]
@@ -232,10 +246,9 @@ enum StorageCleanupService {
             return runningBundleIdentifiers.contains(item.name)
         }
         if item.categoryID == "browserCaches" {
-            return !runningBundleIdentifiers.isDisjoint(with: [
-                "com.apple.Safari", "com.google.Chrome", "com.microsoft.edgemac",
-                "org.mozilla.firefox", "com.brave.Browser"
-            ])
+            return browserCacheRules.contains { marker, bundleID in
+                item.path.contains(marker) && runningBundleIdentifiers.contains(bundleID)
+            }
         }
         if item.path.contains("/Library/Developer/Xcode/DerivedData/") ||
             item.path.contains("/Library/Developer/CoreSimulator/Caches/") {
@@ -284,36 +297,75 @@ enum StorageCleanupService {
 
     /// BSD du 一次接收一批路径，比 Swift 逐文件遍历缓存目录快很多；失败时由
     /// makeItem 回退到受预算限制的 FileManager 枚举。
-    private static func measureSizes(of urls: [URL]) -> [String: Int64] {
-        guard !urls.isEmpty else { return [:] }
+    private static func measureSizes(
+        of urls: [URL],
+        shouldContinue: @escaping @Sendable () -> Bool
+    ) -> [String: Int64] {
+        guard !urls.isEmpty, shouldContinue() else { return [:] }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/du")
         process.arguments = ["-sk"] + urls.map(\.path)
         process.environment = ["LC_ALL": "C", "LANG": "C"]
         let output = Pipe()
+        process.standardInput = FileHandle.nullDevice
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
+
+        final class DataBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var storage = Data()
+            var data: Data {
+                get { lock.withLock { storage } }
+                set { lock.withLock { storage = newValue } }
+            }
+        }
+        let box = DataBox()
+        let group = DispatchGroup()
+        let reader = output.fileHandleForReading
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            box.data = reader.readDataToEndOfFile()
+            group.leave()
+        }
+
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
         do {
             try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return [:] }
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            guard let text = String(data: data, encoding: .utf8) else { return [:] }
-            var result: [String: Int64] = [:]
-            for line in text.split(whereSeparator: \.isNewline) {
-                let parts = line.split(
-                    maxSplits: 1,
-                    omittingEmptySubsequences: true,
-                    whereSeparator: { $0 == " " || $0 == "\t" }
-                )
-                guard parts.count == 2, let kilobytes = Int64(parts[0]) else { continue }
-                let path = String(parts[1])
-                result[path] = max(0, kilobytes) * 1024
-            }
-            return result
         } catch {
+            try? output.fileHandleForWriting.close()
             return [:]
         }
+        try? output.fileHandleForWriting.close()
+
+        let deadline = Date().addingTimeInterval(12.0)
+        while done.wait(timeout: .now() + 0.1) == .timedOut {
+            if !shouldContinue() || Date() >= deadline {
+                process.terminate()
+                if done.wait(timeout: .now() + 0.3) == .timedOut, process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                    _ = done.wait(timeout: .now() + 0.4)
+                }
+                _ = group.wait(timeout: .now() + 0.4)
+                return [:]
+            }
+        }
+        _ = group.wait(timeout: .now() + 1.0)
+        // 注意：当个别受系统 TCC 保护的子目录无权访问时 du 退出码可能为 1，
+        // 但其余有效目录的统计已完整写入 stdout，不应整体丢弃。
+        guard !box.data.isEmpty, let text = String(data: box.data, encoding: .utf8) else { return [:] }
+        var result: [String: Int64] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(
+                maxSplits: 1,
+                omittingEmptySubsequences: true,
+                whereSeparator: { $0 == " " || $0 == "\t" }
+            )
+            guard parts.count == 2, let kilobytes = Int64(parts[0]) else { continue }
+            let path = String(parts[1])
+            result[path] = min(max(0, kilobytes), Int64.max / 1024) * 1024
+        }
+        return result
     }
 
     private static func size(
@@ -368,6 +420,24 @@ enum StorageCleanupService {
 
 // MARK: - Cleanup page
 
+/// 命中穿透标签：点击文字/图标区域时让事件落到所在行卡片，
+/// 不做任何自定义坐标换算，避免依赖 hitTest 的坐标约定。
+@MainActor
+private final class HitThroughTextField: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        return hit === self ? nil : hit
+    }
+}
+
+@MainActor
+private final class HitThroughImageView: NSImageView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        return hit === self ? nil : hit
+    }
+}
+
 @MainActor
 final class StorageCleanupCategoryRow: LiquidGlassCardView {
     let category: StorageCleanupCategory
@@ -376,9 +446,9 @@ final class StorageCleanupCategoryRow: LiquidGlassCardView {
 
     private let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let disclosureButton = NSButton()
-    private let titleLabel = NSTextField(labelWithString: "")
-    private let detailLabel = NSTextField(labelWithString: "")
     private var expanded = false
+    /// 行内是否有任意选中项；用于让点击语义确定化（见 selectionChanged）。
+    private var hasSelection = false
 
     init(category: StorageCleanupCategory) {
         self.category = category
@@ -406,17 +476,17 @@ final class StorageCleanupCategoryRow: LiquidGlassCardView {
         disclosureButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(disclosureButton)
 
-        let image = NSImageView(image: NSImage(systemSymbolName: category.symbol, accessibilityDescription: nil) ?? NSImage())
+        let image = HitThroughImageView(image: NSImage(systemSymbolName: category.symbol, accessibilityDescription: nil) ?? NSImage())
         image.contentTintColor = .systemBlue
         image.translatesAutoresizingMaskIntoConstraints = false
         addSubview(image)
 
-        titleLabel.stringValue = category.title
+        let titleLabel = HitThroughTextField(labelWithString: category.title)
         titleLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(titleLabel)
 
-        detailLabel.stringValue = "\(formatBytes(category.bytes)) · \(category.items.count) 项"
+        let detailLabel = HitThroughTextField(labelWithString: "\(formatBytes(category.bytes)) · \(category.items.count) 项")
         detailLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.lineBreakMode = .byTruncatingTail
@@ -447,8 +517,11 @@ final class StorageCleanupCategoryRow: LiquidGlassCardView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     func setSelectionState(_ state: NSControl.StateValue) {
         checkbox.state = state
+        hasSelection = state != .off
         switch state {
         case .on:
             checkbox.setAccessibilityValue("全部选择")
@@ -469,20 +542,21 @@ final class StorageCleanupCategoryRow: LiquidGlassCardView {
         disclosureButton.setAccessibilityLabel("\(isExpanded ? "收起" : "展开")\(category.title)明细")
     }
 
+    /// 三态复选框被点击时系统会让状态在 未选→半选→全选 间循环，导致
+    /// “未展开时点全选没反应”。这里不信任循环结果，按“有选中即全部取消、
+    /// 无选中即全部勾上”的确定语义上报。
     @objc private func selectionChanged() {
-        onSelectionChanged?(checkbox.state == .on)
+        let shouldSelectAll = !hasSelection
+        hasSelection = shouldSelectAll
+        onSelectionChanged?(shouldSelectAll)
     }
 
     @objc private func toggleExpansion() {
         onExpansionChanged?(!expanded)
     }
 
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        if checkbox.frame.contains(point) { return checkbox }
-        if disclosureButton.frame.contains(point) { return disclosureButton }
-        return self
-    }
-
+    /// 点击行的空白区域（标题、图标等）等价于点展开箭头；
+    /// 复选框与箭头是原生控件且位于更深层级，由 AppKit 自然优先命中。
     override func mouseDown(with event: NSEvent) {
         onExpansionChanged?(!expanded)
     }
@@ -519,19 +593,19 @@ final class StorageCleanupItemRowView: NSView {
         checkbox.translatesAutoresizingMaskIntoConstraints = false
         addSubview(checkbox)
 
-        let icon = NSImageView(image: presentation.icon)
+        let icon = HitThroughImageView(image: presentation.icon)
         icon.imageScaling = .scaleProportionallyDown
         icon.translatesAutoresizingMaskIntoConstraints = false
         addSubview(icon)
 
-        let nameLabel = NSTextField(labelWithString: presentation.name)
+        let nameLabel = HitThroughTextField(labelWithString: presentation.name)
         nameLabel.font = .systemFont(ofSize: 11.5, weight: .medium)
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.toolTip = item.path
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(nameLabel)
 
-        let pathLabel = NSTextField(labelWithString: item.name)
+        let pathLabel = HitThroughTextField(labelWithString: item.name)
         pathLabel.font = .systemFont(ofSize: 9.5)
         pathLabel.textColor = .secondaryLabelColor
         pathLabel.lineBreakMode = .byTruncatingMiddle
@@ -539,7 +613,7 @@ final class StorageCleanupItemRowView: NSView {
         pathLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(pathLabel)
 
-        let sizeLabel = NSTextField(labelWithString: formatBytes(item.bytes))
+        let sizeLabel = HitThroughTextField(labelWithString: formatBytes(item.bytes))
         sizeLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .medium)
         sizeLabel.textColor = .secondaryLabelColor
         sizeLabel.alignment = .right
@@ -547,6 +621,18 @@ final class StorageCleanupItemRowView: NSView {
         sizeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         sizeLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(sizeLabel)
+
+        let revealButton = NSButton()
+        revealButton.image = NSImage(systemSymbolName: "magnifyingglass.circle", accessibilityDescription: "在访达中查看")
+        revealButton.imagePosition = .imageOnly
+        revealButton.isBordered = false
+        revealButton.bezelStyle = .inline
+        revealButton.contentTintColor = .tertiaryLabelColor
+        revealButton.toolTip = "在访达中显示：\(item.path)"
+        revealButton.target = self
+        revealButton.action = #selector(revealInFinder)
+        revealButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(revealButton)
 
         NSLayoutConstraint.activate([
             checkbox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
@@ -563,12 +649,18 @@ final class StorageCleanupItemRowView: NSView {
             pathLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             pathLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 1),
             pathLabel.trailingAnchor.constraint(lessThanOrEqualTo: sizeLabel.leadingAnchor, constant: -8),
-            sizeLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            sizeLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
+            sizeLabel.trailingAnchor.constraint(equalTo: revealButton.leadingAnchor, constant: -6),
+            sizeLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            revealButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            revealButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            revealButton.widthAnchor.constraint(equalToConstant: 20),
+            revealButton.heightAnchor.constraint(equalToConstant: 20)
         ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -583,18 +675,25 @@ final class StorageCleanupItemRowView: NSView {
         layer?.backgroundColor = fill
     }
 
+    /// 外部同步选中态时就地更新，不再销毁重建行视图。
+    func setSelected(_ isSelected: Bool) {
+        selected = isSelected
+        checkbox.state = isSelected ? .on : .off
+    }
+
     @objc private func selectionChanged() {
         selected = checkbox.state == .on
         onSelectionChanged?(selected)
     }
 
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        checkbox.frame.contains(point) ? checkbox : self
+    @objc private func revealInFinder() {
+        let url = URL(fileURLWithPath: item.path)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    /// 点击行内任意非复选框区域即切换选中；复选框为原生控件，由 AppKit 优先命中。
     override func mouseDown(with event: NSEvent) {
-        selected.toggle()
-        checkbox.state = selected ? .on : .off
+        setSelected(!selected)
         onSelectionChanged?(selected)
     }
 
@@ -838,11 +937,14 @@ final class StorageCleanupDashboardView: NSView {
         selectionChanged()
     }
 
+    private var itemRowsByID: [String: StorageCleanupItemRowView] = [:]
+
     private func rebuildVisibleRows() {
         rowsStack.arrangedSubviews.forEach {
             rowsStack.removeArrangedSubview($0)
             $0.removeFromSuperview()
         }
+        itemRowsByID.removeAll()
         for category in currentSnapshot?.categories ?? [] {
             guard let categoryRow = categoryRows[category.id] else { continue }
             categoryRow.setExpanded(expandedCategoryIDs.contains(category.id))
@@ -851,13 +953,21 @@ final class StorageCleanupDashboardView: NSView {
             categoryRow.widthAnchor.constraint(equalTo: rowsStack.widthAnchor).isActive = true
             guard expandedCategoryIDs.contains(category.id) else { continue }
             for item in category.items {
-                let itemRow = StorageCleanupItemRowView(
-                    item: item,
-                    selected: selectedItemIDs.contains(item.id)
-                )
-                itemRow.onSelectionChanged = { [weak self] selected in
-                    self?.setItem(item, selected: selected)
+                let itemID = item.id
+                let itemRow: StorageCleanupItemRowView
+                if let existing = itemRowsByID[itemID] {
+                    itemRow = existing
+                } else {
+                    itemRow = StorageCleanupItemRowView(
+                        item: item,
+                        selected: selectedItemIDs.contains(itemID)
+                    )
+                    itemRow.onSelectionChanged = { [weak self] selected in
+                        self?.setItem(item, selected: selected)
+                    }
                 }
+                itemRowsByID[itemID] = itemRow
+                itemRow.setSelected(selectedItemIDs.contains(itemID))
                 rowsStack.addArrangedSubview(itemRow)
                 itemRow.widthAnchor.constraint(equalTo: rowsStack.widthAnchor).isActive = true
             }

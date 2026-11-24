@@ -54,9 +54,33 @@ Source projects and notices:
 - https://gist.github.com/nikias/ebc6e975dc908f3741af0f789c5b1088
 - https://www.openssl.org/source/license.html
 
-The LGPL license text distributed with the toolchain is included at
-`Resources/libimobiledevice/COPYING`. These executables and dynamic libraries
-remain replaceable files inside the application resource bundle.
+The existing `Resources/libimobiledevice/COPYING` contains GPL-2.0 text,
+not the LGPL text. Packaging preserves that file and adds LGPL-2.1 text at
+`Contents/Resources/Licenses/LGPL-2.1.txt` and the OpenSSL 3 Apache-2.0
+license at `Contents/Resources/Licenses/OpenSSL-Apache-2.0.txt`. Copies of
+these texts are maintained under `Helpers/Licenses/`. The executables and
+dynamic libraries remain replaceable files inside the application resource
+bundle. The original bundle's `NOTICE.md` is also retained.
+
+The existing binary snapshot does not include exact source revisions or
+build recipes for these tools, nor a separate license for the companion
+example. The source links above are attribution references, not a claim
+that complete corresponding sources accompany this package.
+
+## m1ddc / display helpers
+
+`Helpers/m1ddc-vendor` contains the required transport-discovery source and
+headers from the locally supplied, modified m1ddc snapshot:
+https://github.com/waydabber/m1ddc
+
+MIT License — Copyright (c) 2021 waydabber.
+
+The complete license is preserved at `Helpers/m1ddc-vendor/LICENSE` and
+shipped as `Contents/Resources/Licenses/m1ddc-MIT.txt`. `DDCControl` links
+the transport-discovery implementation; the standalone m1ddc executable and
+its CLI are not shipped. The snapshot includes local transport changes and
+is not identified as an unmodified upstream release. Helper source origins
+and the narrowly scoped relocation changes are recorded in `Helpers/README.md`.
 
 ## 9Router reference
 
